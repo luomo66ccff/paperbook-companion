@@ -339,3 +339,75 @@ def test_concurrent_qa_preserves_all_turns_and_chinese_keyword_retrieval(pipelin
     saved = service.session(book, session_id)
     assert len(saved['turns']) == 9
     assert len({turn['turn_id'] for turn in saved['turns']}) == 9
+
+
+def test_moment_search_is_sentence_level_and_gains_film_clock_after_export(pipeline):
+    client, service, *_ = pipeline
+    book = imported(client, service)
+    assert media(client, service, book)['status'] == 'succeeded'
+    before = client.get(f'/api/books/{book}/search', query_string={'q': 'fox'}).get_json()
+    assert before['success'] and before['film'] is False and isinstance(before['timing_ms'], float)
+    fox = before['moments'][0]
+    assert fox['kind'] == 'speech' and fox['page_id'] == 'p0001' and 'Fox' in fox['text']
+    assert fox['start'] == pytest.approx(.12) and fox['book_start'] is None
+    job = service.wait_for_job(client.post(f'/api/books/{book}/export', json={}).get_json()['job_id'])
+    assert job['status'] == 'succeeded', job
+    after = client.get(f'/api/books/{book}/search', query_string={'q': 'fox likes'}).get_json()
+    assert after['film'] is True
+    assert after['moments'][0]['book_start'] == pytest.approx(.12) and after['moments'][0]['book_end'] == pytest.approx(.24)
+    assert client.get(f'/api/books/{book}/search', query_string={'q': ''}).status_code == 400
+    assert client.get(f'/api/books/{book}/search', query_string={'q': 'fox', 'page_id': 'p9999'}).status_code == 400
+
+
+def test_picture_vocabulary_finds_wordless_pages_but_is_marked_inferred(pipeline):
+    client, service, calls, *_ = pipeline
+    book = imported(client, service)
+    manifest = service.manifest(book)
+    manifest['pages'][1]['objects']['detections'] = [{'label': '小松鼠<squirrel>', 'box': [1, 1, 20, 20]}]
+    manifest['pages'][1]['scene_analysis'] = {'status': 'ready', 'inferred': True, 'data': {
+        'summary': 'A squirrel holds a nut', 'scene': 'forest', 'characters': ['squirrel'], 'key_objects': ['nut']}}
+    service._save_manifest(book, manifest)
+    found = service.search(book, '小松鼠在哪')
+    assert found['moments'][0]['kind'] == 'visual' and found['moments'][0]['page_id'] == 'p0002'
+    assert found['moments'][0]['inferred'] is True and '小松鼠' in found['moments'][0]['text']
+    answer = client.post(f"/api/books/{book}/qa", json={"question": "rabbit squirrel nut"}).get_json()
+    cited = {cite['page_id']: cite for cite in calls['answer'][-1][1]}
+    assert 'p0002' in cited and cited['p0002']['visual']['inferred'] is True and cited['p0002']['excerpt'] == ''
+    assert answer['turn']['moments'] == answer['moments']
+    # Text evidence still outranks picture vocabulary.
+    ranked = service.qa(book, {'question': 'Rabbit apples squirrel'})
+    assert ranked['citations'][0]['page_id'] == 'p0001'
+
+
+def test_sentences_keep_closing_quotes_and_narration_skips_layout_furniture():
+    from app.book_pipeline import _sentences, _narration_text
+    text = ('夏天热，夏天长，夏天菜园菜成行。\n“绿色的蔬菜，红色的蔬菜，\n黄色的蔬菜，我都爱！”\n“快看，有个番茄在动！”\n'
+            '汉字源流\n甲骨文\n楷书\n夏\n金文\n小篆\n隶书\n阅读指导\n猜一猜，番茄为什么会动？')
+    narration = _narration_text(text)
+    assert '汉字源流' not in narration and '阅读指导' not in narration and '猜一猜' not in narration
+    sentences = _sentences(narration)
+    assert sentences == ['夏天热，夏天长，夏天菜园菜成行。', '“绿色的蔬菜，红色的蔬菜，', '黄色的蔬菜，我都爱！”', '“快看，有个番茄在动！”']
+    assert all(any(ch.isalnum() for ch in s) for s in sentences)
+    assert _narration_text('仅供第二届北京市大学生“人工智能+”创新大赛使用，请勿外传\nThe fox ran.') == 'The fox ran.'
+    assert _sentences('Run! "Stop," he said. Then he left.') == ['Run!', '"Stop," he said.', 'Then he left.']
+
+
+def test_one_failing_page_does_not_abandon_the_book_and_retry_drops_force(pipeline):
+    client, service, calls, *_ = pipeline
+    book = imported(client, service)
+    real = service.adapters['synthesize']
+    def flaky(text, voice, output_path, language):
+        if 'Fox' in text:
+            raise RuntimeError('NoAudioReceived')
+        return real(text, voice, output_path, language)
+    service.adapters['synthesize'] = flaky
+    job = media(client, service, book, force=True)
+    assert job['status'] == 'failed' and '第1页朗读' in job['error'] and '1 / 2' in job['error']
+    pages = service.manifest(book)['pages']
+    assert pages[0]['media']['tts']['status'] == 'failed' and pages[1]['media']['video']['status'] == 'ready'
+    service.adapters['synthesize'] = real
+    videos = calls['video']
+    client.post(f"/api/jobs/{job['job_id']}/retry")
+    retried = service.wait_for_job(job['job_id'])
+    assert retried['status'] == 'succeeded' and retried['request']['force'] is False
+    assert calls['video'] == videos + 1  # only the failed page made a new (paid) video call

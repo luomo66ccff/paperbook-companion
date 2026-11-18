@@ -49,11 +49,12 @@
         <div class="view-controls">
           <div class="segmented" role="group" aria-label="画面选择">
             <button id="showImage" type="button" aria-pressed="true"><span aria-hidden="true">🖼</span> 原图</button>
-            <button id="showVideo" type="button" aria-pressed="false" disabled><span aria-hidden="true">🎬</span> 动画</button>
+            <button id="showVideo" type="button" aria-pressed="false" disabled><span aria-hidden="true">🎬</span> 页动画</button>
+            <button id="showFilm" type="button" aria-pressed="false" disabled><span aria-hidden="true">🎞</span> 整本影片</button>
           </div>
           <span id="mediaState" class="subtle">没有动画时也能看原图哦</span>
         </div>
-        <div id="mediaStage" class="media-stage" tabindex="0" aria-label="绘本画面，点一点认识里面的东西">
+        <div id="mediaStage" class="media-stage" tabindex="0" data-source="image" aria-label="绘本画面，点一点认识里面的东西">
           <div id="stageEmpty" class="stage-empty">
             <svg class="stage-mascot" viewBox="0 0 64 64" aria-hidden="true" focusable="false">
               <path d="M8 14q24-8 24 4v38q0-10-24-4z" fill="#FFC93C" stroke="#3A2A1C" stroke-width="3" stroke-linejoin="round"/>
@@ -85,11 +86,23 @@
         </div>
         <div class="seek-line">
           <span id="currentTime">0:00</span>
-          <input id="seek" type="range" min="0" max="1" step="0.01" value="0" aria-label="本页播放进度" disabled>
+          <div class="seek-track">
+            <input id="seek" type="range" min="0" max="1" step="0.01" value="0" aria-label="播放进度" disabled>
+            <div id="chapterTicks" class="chapter-ticks" aria-hidden="true"></div>
+          </div>
           <span id="duration">0:00</span>
           <span id="pageNumber" class="page-number">— / —</span>
         </div>
         <audio id="pageAudio" controls preload="metadata" hidden aria-label="本页朗读"></audio>
+        <form id="momentForm" class="moment-form" role="search" aria-label="在故事和影片里找一找">
+          <label for="momentQuery"><span aria-hidden="true">🔎</span> 在故事里找一找</label>
+          <div class="moment-row">
+            <input id="momentQuery" type="search" maxlength="200" placeholder="比如：红苹果、小狐狸" autocomplete="off" disabled>
+            <button id="momentSearch" type="submit" class="go" disabled>找一找</button>
+          </div>
+          <p class="subtle">不用等大模型：直接找到说到它、画到它的那一句，点一下就从那里开始播。</p>
+        </form>
+        <div id="momentResults" class="moment-results" aria-live="polite"></div>
       </section>
 
       <aside class="chat-panel card" aria-labelledby="chatTitle">
@@ -115,7 +128,7 @@
     </div>
 
     <details id="grownup" class="grownup">
-      <summary><span aria-hidden="true">🧰</span> 大人工具箱 <span class="lock">导入绘本 · 朗读与动画 · 准备进度</span></summary>
+      <summary><span aria-hidden="true">🧰</span> 大人工具箱 <span class="lock">导入绘本 · 朗读与动画 · 交互延迟 · 准备进度</span></summary>
       <div class="tools">
         <section class="tool import-panel" aria-labelledby="importTitle">
           <h2 id="importTitle">📥 打开一本新绘本</h2>
@@ -139,6 +152,11 @@
           <div class="button-row"><button id="generateBook" type="button" disabled>准备整本</button><button id="generatePage" type="button" disabled>只准备这一页</button><button id="exportBook" type="button" class="go" disabled>合成完整影片</button></div>
           <p id="generationHint" class="subtle">阅读原图无需等待整本制作完成。</p>
           <div id="exportLinks" class="export-links"></div>
+        </section>
+        <section class="tool latency-panel" aria-labelledby="latencyTitle">
+          <h2 id="latencyTitle">⏱ 交互延迟（本机实测）</h2>
+          <label class="checkbox"><input id="prefetchFrames" type="checkbox" checked>暂停时预先看一眼画面（点读更快；每个新画面多一次看图调用）</label>
+          <div id="latencyList"></div>
         </section>
         <section class="tool tasks-panel" aria-labelledby="tasksTitle">
           <h2 id="tasksTitle">⏳ 准备进度</h2>

@@ -49,3 +49,59 @@ test('resume requires unchanged media, previously playing, and successful uncanc
   assert.equal(shouldResume(snapshot, snapshot, { playbackRejected: true }), false);
   assert.equal(shouldResume(snapshot, { ...snapshot, frameTime: 2 }), false);
 });
+
+const { pageAtTime, sentenceAt, momentTarget, frameKey, splitLabel, median } = require('../../app/book_ui.js');
+
+test('film clock maps to pages by quantized visual boundaries', () => {
+  const timeline = [{ page_id: 'p0001', book_start: 0, book_end: 1.01, video_start: 0, video_end: 1.0 },
+    { page_id: 'p0002', book_start: 1.01, book_end: 2.5, video_start: 1.0, video_end: 2.5 }];
+  assert.equal(pageAtTime(timeline, 0), 0);
+  assert.equal(pageAtTime(timeline, 1.005), 1);
+  assert.equal(pageAtTime(timeline, 2.5), 1);
+  assert.equal(pageAtTime(timeline, -1), -1);
+  assert.equal(pageAtTime([], 1), -1);
+  const rows = [{ text: 'a', book_start: 0, book_end: 1 }, { text: 'b', book_start: 1, book_end: 2 }];
+  assert.equal(sentenceAt(rows, 1.2, 'book_start', 'book_end').text, 'b');
+  assert.equal(sentenceAt(rows, 3, 'book_start', 'book_end'), null);
+});
+
+test('moments play on the film clock only when the film exists', () => {
+  const moment = { page_id: 'p0002', start: .4, book_start: 1.4 };
+  assert.deepEqual(momentTarget(moment, true), { mode: 'film', time: 1.4 });
+  assert.deepEqual(momentTarget(moment, false), { mode: 'page', pageId: 'p0002', time: .4 });
+  assert.deepEqual(momentTarget({ page_id: 'p0003', start: null, book_start: null }, true), { mode: 'page', pageId: 'p0003', time: null });
+  assert.equal(momentTarget({}, true), null);
+});
+
+test('frame keys ignore epoch but change with media, page and frame time', () => {
+  const ctx = { bookId: 'b', pageId: 'p0001', source: 'film', mediaPath: 'film:/x.mp4', frameTime: 1.25, epoch: 1 };
+  assert.equal(frameKey(ctx), frameKey({ ...ctx, epoch: 9 }));
+  assert.notEqual(frameKey(ctx), frameKey({ ...ctx, frameTime: 1.3 }));
+  assert.notEqual(frameKey(ctx), frameKey({ ...ctx, pageId: 'p0002' }));
+  assert.equal(frameKey({ ...ctx, source: 'image', frameTime: 4 }), frameKey({ ...ctx, source: 'image', frameTime: 0 }));
+  assert.equal(frameKey({ ...ctx, pageId: '' }), '');
+});
+
+test('film frames are compared by time like page clips', () => {
+  const film = { bookId: 'b', pageId: 'p1', mediaPath: 'film:/x', epoch: 1, source: 'film', frameTime: 3 };
+  assert.equal(sameContext(film, { ...film }), true);
+  assert.equal(sameContext(film, { ...film, frameTime: 3.5 }), false);
+  assert.equal(sameContext(film, { ...film, source: 'video' }), false);
+});
+
+test('bilingual labels display both names and median is robust', () => {
+  assert.deepEqual(splitLabel('小兔子<rabbit>'), { zh: '小兔子', en: 'rabbit', display: '小兔子 · rabbit' });
+  assert.deepEqual(splitLabel('苹果'), { zh: '苹果', en: '', display: '苹果' });
+  assert.deepEqual(splitLabel('<apple>'), { zh: 'apple', en: 'apple', display: 'apple' });
+  assert.equal(median([5, 1, 3]), 3);
+  assert.equal(median([4, 1, 3, 2]), 2.5);
+  assert.equal(median([]), null);
+});
+
+test('export readiness lists every page still missing narration or animation', () => {
+  const { mediaReadiness } = require('../../app/book_ui.js');
+  const page = (num, tts, video) => ({ page_num: num, media: { tts: { status: tts }, video: { status: video } } });
+  assert.deepEqual(mediaReadiness([page(1, 'not_requested', 'not_requested'), page(2, 'ready', 'ready'), page(3, 'silent', 'ready'), page(4, 'ready', 'failed')]),
+    { total: 4, ready: 2, missing: [1, 4] });
+  assert.deepEqual(mediaReadiness(undefined), { total: 0, ready: 0, missing: [] });
+});

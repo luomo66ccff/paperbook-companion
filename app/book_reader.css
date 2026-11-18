@@ -176,6 +176,47 @@ input[type=range]{flex:1;min-height:28px;padding:0;border:0;background:transpare
 .task-item.failed{border-left-color:var(--tomato);background:var(--danger-pale)}
 .task-item.failed p{color:var(--danger)}
 
+/* ---------- 视频交互：整本影片、章节、找一找、点读反馈 ---------- */
+.media-stage[data-source=film]{aspect-ratio:16/9;background:#1E1712}
+.media-stage[data-source=film]::before{content:"🎞 整本影片";position:absolute;left:14px;top:12px;z-index:4;background:#1E1712cc;color:#FFF7E8;border-radius:999px;padding:2px 12px;font-size:.8rem;font-weight:800;pointer-events:none}
+.media-stage.is-playing::after{content:"点一点画面，小页会暂停并告诉你那是什么";position:absolute;left:50%;bottom:12px;transform:translateX(-50%);z-index:4;background:#3A2A1Cd9;color:#fff;border-radius:999px;padding:4px 14px;font-size:.82rem;font-weight:700;white-space:nowrap;pointer-events:none;opacity:0;animation:hint 4s ease-out 1}
+@keyframes hint{10%,70%{opacity:1}100%{opacity:0}}
+.tap-ripple{position:absolute;z-index:5;width:18px;height:18px;margin:-9px 0 0 -9px;border-radius:50%;border:3px solid var(--sun);background:#FFC93C66;pointer-events:none;animation:ripple 650ms ease-out forwards}
+@keyframes ripple{to{transform:scale(4.2);opacity:0}}
+#pageSubtitle.speaking{background:linear-gradient(transparent 62%,#FFE08A 62%);border-radius:4px;box-decoration-break:clone;-webkit-box-decoration-break:clone}
+.seek-track{position:relative;flex:1;min-width:140px;display:flex;align-items:center}
+.seek-track input{width:100%}
+.chapter-ticks{position:absolute;left:8px;right:8px;top:50%;height:0;pointer-events:none}
+.tick{position:absolute;top:-9px;width:4px;height:18px;margin-left:-2px;border-radius:3px;background:var(--ink-soft);opacity:.55;pointer-events:auto;cursor:pointer}
+.tick.chapter{width:6px;margin-left:-3px;background:var(--ink);opacity:.85}
+.tick:hover{opacity:1;background:var(--tomato)}
+.moment-form{display:grid;gap:8px;background:var(--sky-pale);border:3px solid #9CC5F5;border-radius:var(--r-m);padding:12px 16px}
+.moment-form>label{display:flex;align-items:center;gap:6px;font-size:1rem}
+.moment-row{display:flex;gap:10px}
+.moment-row input{flex:1;background:#fff;border:3px solid var(--ink);border-radius:999px;padding:8px 18px;font-size:1rem}
+.moment-row button{white-space:nowrap}
+.moment-results:empty{display:none}
+.moment-list{list-style:none;margin:0;padding:0;display:grid;gap:8px}
+.moment{width:100%;display:grid;justify-items:start;justify-content:stretch;gap:2px;text-align:left;border-radius:var(--r-s);border-width:2px;padding:8px 14px;box-shadow:0 3px 0 var(--line);border-color:var(--line);background:#fff;min-height:48px}
+.moment:hover:not(:disabled){border-color:var(--sky);box-shadow:0 5px 0 #9CC5F5}
+.moment-when{font-size:.8rem;font-weight:900;color:var(--sky)}
+.moment-text{font-weight:700;overflow-wrap:anywhere}
+.moment.inferred{border-style:dashed}
+.moment-flag{font-size:.75rem;color:var(--ink-soft);font-weight:700}
+.turn-moments{display:grid;gap:6px;background:var(--sky-pale);border-radius:var(--r-s);padding:8px 10px}
+.moments-title{font-size:.85rem;font-weight:800;color:var(--sky)}
+.turn-moments .moment{padding:6px 12px;min-height:44px;font-size:.92rem}
+.citation .film-jump{border-color:var(--tomato);color:var(--tomato);box-shadow:0 3px 0 #F3B3A6}
+.citation .film-jump::after{content:none}
+.latency-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
+.latency-cell{display:grid;gap:2px;background:var(--paper);border-left:6px solid var(--sun);border-radius:12px;padding:8px 12px}
+.latency-cell.fast{border-left-color:var(--leaf)}
+.latency-cell.slow{border-left-color:var(--tomato)}
+.latency-cell strong{font-size:.9rem}
+.latency-median{font-size:1.15rem;font-weight:900;font-variant-numeric:tabular-nums}
+.latency-cell small{color:var(--ink-soft);font-size:.75rem;font-weight:600}
+.latency-panel .checkbox{white-space:normal;align-items:flex-start;font-weight:600;font-size:.88rem}
+
 footer{text-align:center;color:var(--ink-soft);padding:6px 16px 30px;font-weight:700}
 
 /* ---------- 断点 ---------- */
@@ -207,6 +248,10 @@ footer{text-align:center;color:var(--ink-soft);padding:6px 16px 30px;font-weight
   .playback-controls button{min-height:56px;padding:8px 4px;font-size:.95rem;min-width:0;white-space:nowrap}
   .playback-controls .play{min-width:0;min-height:64px;font-size:1.2rem}
   .page-item{flex-basis:112px}
+  .segmented{width:100%}
+  .segmented button{flex:1;padding:4px 8px;font-size:.9rem}
+  .moment-row{flex-direction:column}
+  .media-stage.is-playing::after{white-space:normal;width:86%;text-align:center}
   .tools{padding:0 12px 12px}
   .mascot{width:52px;height:52px}
   .brand-text b{font-size:1.5rem}

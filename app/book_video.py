@@ -141,12 +141,16 @@ def export_book(book_dir, manifest, options=None, force=False):
     pages = manifest.get('pages', [])
     if not pages:
         raise MediaError('书本没有可导出的页')
+    missing = [str(page.get('page_num', page['page_id'])) for page in pages
+               if page.get('media', {}).get('tts', {}).get('status') not in ('ready', 'silent')
+               or page.get('media', {}).get('video', {}).get('status') != 'ready']
+    if missing:
+        listed = '、'.join(missing[:8]) + ('…' if len(missing) > 8 else '')
+        raise MediaError(f'还有 {len(missing)} 页的朗读或动画未完成（第 {listed} 页），请先点“准备整本”，完成后再合成')
     prepared, identities = [], []
     for page in pages:
         tts, video = page.get('media', {}).get('tts', {}), page.get('media', {}).get('video', {})
-        if tts.get('status') not in ('ready', 'silent') or video.get('status') != 'ready':
-            raise MediaError(f"{page['page_id']} 的配音或视频未完成")
-        if page.get('text', '').strip() and tts.get('status') == 'silent':
+        if page.get('text', '').strip() and tts.get('status') == 'silent' and tts.get('silent_reason') != 'no_narration_text':
             raise MediaError('有文字页不能以静音冒充配音')
         audio = _inside(root, tts.get('path'))
         clip = _inside(root, video.get('path'))
@@ -161,7 +165,7 @@ def export_book(book_dir, manifest, options=None, force=False):
                            'sentences': tts.get('sentences', [])})
     key = hashlib.sha256(json.dumps({'version': 2, 'pages': identities, 'options': settings},
                                    ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-    relative = f'exports/{key}'
+    relative = f'exports/{key[:24]}'  # short dir: Windows MAX_PATH
     destination = root / relative
     if not force and (destination / 'result.json').is_file():
         try:

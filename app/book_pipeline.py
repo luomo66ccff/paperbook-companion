@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import threading
+import time
 import uuid
 from urllib.parse import quote
 
@@ -72,8 +73,53 @@ def _identifier(value, kind='标识'):
     return value
 
 
+_CLOSERS = '”’"\'』」）)》】'
+_SPEAKABLE = re.compile(r'[0-9A-Za-z㐀-鿿]')
+
+
 def _sentences(text):
-    return [s.strip() for s in re.split(r'(?<=[。！？!?])\s*|(?<=\.)\s+|\n+', text) if s.strip()]
+    """Split into speakable sentences. Closing quotes/brackets stay with their sentence,
+    and punctuation-only fragments (e.g. a lone ”) are merged back instead of being sent
+    to TTS, which returns no audio for them."""
+    parts = re.split(r'(?<=[。！？!?…])(?![' + re.escape(_CLOSERS) + r'。！？!?…])\s*'
+                     r'|(?<=[。！？!?…][' + re.escape(_CLOSERS) + r'])\s*'
+                     r'|(?<=\.)\s+|\n+', text)
+    result = []
+    for part in (p.strip() for p in parts):
+        if not part:
+            continue
+        if not _SPEAKABLE.search(part):
+            if result:
+                result[-1] += part
+            continue
+        result.append(part)
+    return result
+
+
+# Layout furniture of the sample series (character-origin sidebar, reading-guide box) and
+# competition watermarks. Page text keeps them for QA/search; narration skips them.
+_SIDEBAR_LABELS = {'汉字源流', '甲骨文', '金文', '小篆', '隶书', '楷书'}
+_WATERMARK = re.compile(r'请勿外传|仅供.{0,40}(?:比赛|大赛)|创新大赛|纸书智伴')
+
+
+def _narration_text(text):
+    lines, skip_guide = [], False
+    for raw in (text or '').splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if _WATERMARK.search(line) or line in _SIDEBAR_LABELS:
+            continue
+        if re.fullmatch(r'[㐀-鿿]', line):
+            continue  # the single character shown in the character-origin sidebar
+        if line == '阅读指导':
+            skip_guide = True
+            continue
+        if skip_guide:
+            skip_guide = False
+            continue  # the one guide question is addressed to the grown-up, not narrated
+        lines.append(line)
+    return '\n'.join(lines).strip()
 
 
 def _tokens(text):
@@ -84,6 +130,87 @@ def _tokens(text):
         if len(run) == 1:
             result.add(run)
     return result
+
+
+# Question scaffolding bigrams carry no story content; they only add noise to moment search.
+_QUERY_STOP = {'什么', '怎么', '为什', '么时', '时候', '哪里', '哪儿', '这个', '那个', '是谁', '在哪',
+               '了吗', '是什', '么呢', '一下', '告诉', '诉我', '我们', '你们', '有没', '的是', '找找',
+               '一找', '找一', '画面', '视频', '影片', '出现', '现在', '里面', '哪一', '一页', '哪页'}
+
+
+def _query_tokens(text):
+    return _tokens(text) - _QUERY_STOP
+
+
+def _clean_label(value):
+    return re.sub(r'<[^>]*>', '', str(value or '')).strip()
+
+
+def _visual_terms(page):
+    """Model-inferred picture vocabulary for a page: scene summary, characters, objects, boxes."""
+    terms = []
+    scene = page.get('scene_analysis') or {}
+    data = scene.get('data') if scene.get('status') == 'ready' else None
+    if isinstance(data, dict):
+        for key in ('summary', 'scene'):
+            if isinstance(data.get(key), str):
+                terms.append(data[key])
+        for key in ('characters', 'key_objects'):
+            for item in data.get(key) or []:
+                if isinstance(item, str):
+                    terms.append(item)
+                elif isinstance(item, dict):
+                    terms.extend(str(v) for v in item.values() if isinstance(v, str))
+    for detection in (page.get('objects') or {}).get('detections') or []:
+        if isinstance(detection, dict):
+            terms.append(_clean_label(detection.get('label')))
+    seen, result = set(), []
+    for term in (t.strip() for t in terms):
+        if term and term not in seen:
+            seen.add(term)
+            result.append(term[:200])
+    return result
+
+
+def search_moments(manifest, timeline, queries, page_id=None, limit=5):
+    """Rank sentence-level speech moments and page-level picture moments.
+
+    Speech rows carry page-local start/end from measured sentence WAVs and, once
+    the whole film is exported, book_start/book_end on the film clock. Visual
+    rows are model-inferred and always marked as such.
+    """
+    timing = {row['page_id']: row for row in timeline or []}
+    rows = []
+    for page in manifest.get('pages', []):
+        pid, row = page['page_id'], timing.get(page['page_id'])
+        boost = .5 if pid == page_id else 0
+        tts = (page.get('media') or {}).get('tts') or {}
+        spoken = (row or {}).get('sentences') or (tts.get('sentences') if tts.get('status') == 'ready' else None) or []
+        base = {'page_id': pid, 'page_num': page['page_num']}
+        if spoken:
+            for sentence in spoken:
+                score = len(queries & _tokens(sentence.get('text', '')))
+                if score:
+                    rows.append((score + boost, {**base, 'kind': 'speech', 'text': sentence['text'],
+                                                 'start': sentence.get('start'), 'end': sentence.get('end'),
+                                                 'book_start': sentence.get('book_start'), 'book_end': sentence.get('book_end'),
+                                                 'inferred': False}))
+        else:
+            for sentence in _sentences(page.get('text', '')):
+                score = len(queries & _tokens(sentence))
+                if score:
+                    rows.append((score + boost, {**base, 'kind': 'text', 'text': sentence, 'start': None, 'end': None,
+                                                 'book_start': None, 'book_end': None, 'inferred': False}))
+        hits = [term for term in _visual_terms(page) if queries & _tokens(term)]
+        if hits:
+            score = len(queries & _tokens(' '.join(hits))) - .25
+            rows.append((score + boost, {**base, 'kind': 'visual', 'text': '画面里有：' + '、'.join(hits[:4]),
+                                         'start': 0.0, 'end': tts.get('duration'),
+                                         'book_start': row.get('video_start', row['book_start']) if row else None,
+                                         'book_end': row.get('video_end', row['book_end']) if row else None,
+                                         'inferred': True}))
+    rows.sort(key=lambda item: (-item[0], item[1]['page_num'], item[1]['start'] or 0))
+    return [dict(item, score=round(score, 3)) for score, item in rows[:limit]]
 
 
 class BookPipelineService:
@@ -199,7 +326,11 @@ class BookPipelineService:
             job = self.job(job_id)
             if job['status'] not in ('failed', 'interrupted'):
                 raise PipelineError('仅失败或中断的任务可重试', 409)
-            self._update_job(job_id, status='queued', error=None, result=None, finished_at=None)
+            changes = {}
+            if job.get('kind') == 'media' and job.get('request', {}).get('force'):
+                # A retry finishes what is missing; pages already regenerated stay cached (no repeat paid calls).
+                changes['request'] = {**job['request'], 'force': False}
+            self._update_job(job_id, status='queued', error=None, result=None, finished_at=None, **changes)
             self._futures[job_id] = self.executor.submit(self._run_job, job_id)
         return job_id
 
@@ -224,7 +355,7 @@ class BookPipelineService:
                 self._update_job(job_id, status='succeeded', result=result, finished_at=_now())
             except Exception as exc:
                 # Unexpected adapters must not leak absolute paths/provider secrets.
-                error = str(exc) if isinstance(exc, (PipelineError, MediaError)) else f'任务执行失败（{type(exc).__name__}），请检查配置和受控服务'
+                error = str(exc) if isinstance(exc, (PipelineError, MediaError)) else f'任务执行失败（{type(exc).__name__}），请检查接口配置或稍后重试'
                 self._update_job(job_id, status='failed', error=error, finished_at=_now())
                 manifest = self.manifest(book_id)
                 manifest['last_error'] = {'kind': kind, 'message': error, 'job_id': job_id}
@@ -312,7 +443,7 @@ class BookPipelineService:
         # Tool paths belong to trusted server config, never user JSON.
         if any(k in options for k in ('ffmpeg', 'ffprobe')):
             raise PipelineError('视频请求不能指定可执行文件')
-        force, completed = bool(payload.get('force', False)), []
+        force, completed, failures = bool(payload.get('force', False)), [], []
         caps = self.adapters.get('capabilities', lambda: {})()
         for page in manifest['pages']:
             if page['page_id'] not in selected:
@@ -323,13 +454,15 @@ class BookPipelineService:
                     raise PipelineError('此页文字尚未可靠读取，请先重新分析，不能以静音代替')
                 image = self.asset(book_id, page['image_path'])
                 text = page.get('text', '').strip()
-                base_key = {'version': 1, 'text': text, 'image_sha256': hashlib.sha256(image.read_bytes()).hexdigest(),
+                # Narration skips layout furniture/watermarks; the page text itself is unchanged.
+                narration = _narration_text(text)
+                base_key = {'version': 1, 'text': narration, 'image_sha256': hashlib.sha256(image.read_bytes()).hexdigest(),
                             'voice': voice, 'language': manifest.get('language', 'zh'), 'options': options,
                             'models': {**self.config.get('cache_identity', {}),
                                        'reader_vl_model': self.config.get('reader_options', {}).get('vl_model'),
-                                       'capabilities': caps}, 'prompt_version': 'book-page-v1'}
+                                       'capabilities': caps}, 'prompt_version': 'book-page-v2'}
                 tts_key = _hash({**base_key, 'stage': 'tts'})
-                target_rel = f"media/{page['page_id']}/{tts_key}"
+                target_rel = f"media/{page['page_id']}/{tts_key[:24]}"  # short dir: Windows MAX_PATH; full key stays in the manifest
                 media_dir = self.book_dir(book_id) / target_rel
                 media_dir.mkdir(parents=True, exist_ok=True)
                 old = page['media'].get('tts', {})
@@ -346,11 +479,11 @@ class BookPipelineService:
                     page['media']['tts'] = {'status': 'running', 'cache_key': tts_key}
                     self._save_manifest(book_id, manifest)
                     sentences, files, elapsed = [], [], 0.0
-                    if text:
+                    if narration:
                         synthesize = self.adapters.get('synthesize')
                         if synthesize is None:
                             raise PipelineError('未配置配音适配器', 503)
-                        for index, sentence in enumerate(_sentences(text)):
+                        for index, sentence in enumerate(_sentences(narration)):
                             path = media_dir / f'sentence_{index + 1:04d}.wav'
                             returned = synthesize(sentence, voice, str(path), manifest.get('language', 'zh'))
                             if not returned or not Path(returned).is_file():
@@ -372,13 +505,13 @@ class BookPipelineService:
                     page['media']['tts'] = {'status': status, 'cache_key': tts_key, 'path': rel,
                                             'url': self.asset_url(book_id, rel), 'duration': duration,
                                             'sentences': sentences, 'voice': voice, 'cached': False,
-                                            'silent_reason': 'confirmed_empty_page' if not text else None}
+                                            'silent_reason': None if narration else ('confirmed_empty_page' if not text else 'no_narration_text')}
                 else:
                     page['media']['tts']['cached'] = True
                 stage = 'video'
-                prompt = '保持原页画风、角色和构图，轻微自然运动，不添加文字。页面转录：' + text
+                prompt = '保持原页画风、角色和构图，轻微自然运动，不添加文字。页面转录：' + narration
                 video_key = _hash({**base_key, 'stage': 'video', 'prompt': prompt})
-                video_rel = f"media/{page['page_id']}/{video_key}/clip.mp4"
+                video_rel = f"media/{page['page_id']}/{video_key[:24]}/clip.mp4"
                 video_path = self.book_dir(book_id) / video_rel
                 old = page['media'].get('video', {})
                 cached = not force and old.get('cache_key') == video_key and old.get('status') == 'ready'
@@ -413,11 +546,18 @@ class BookPipelineService:
                 manifest['exports'] = None
                 self._save_manifest(book_id, manifest)
                 self._update_job(job_id, progress={'current': len(completed), 'total': len(selected), 'page_id': page['page_id']})
-            except Exception:
+            except Exception as exc:
+                # One page failing must not abandon the rest of the book (or waste finished paid calls).
+                reason = str(exc) if isinstance(exc, PipelineError) else type(exc).__name__
                 page['media'].setdefault(stage, {})['status'] = 'failed'
-                page['media'][stage]['error'] = '生成未完成，请检查适配器配置或重试'
+                page['media'][stage]['error'] = ('朗读' if stage == 'tts' else '动画') + '生成未完成（' + reason[:120] + '），可重试'
                 self._save_manifest(book_id, manifest)
-                raise
+                failures.append((page['page_num'], stage, reason))
+                if isinstance(exc, PipelineError) and exc.status == 503:
+                    break  # the adapter is not configured at all; other pages would fail the same way
+        if failures:
+            listed = '、'.join(f"第{num}页{'朗读' if stage == 'tts' else '动画'}（{reason[:60]}）" for num, stage, reason in failures[:6])
+            raise PipelineError(f'已完成 {len(completed)} / {len(selected)} 页；未完成：{listed}' + ('…' if len(failures) > 6 else '') + '。可点“重试”只补做未完成的页', 502)
         return {'book_id': book_id, 'page_ids': completed}
 
     def _export(self, book_id, payload, job_id):
@@ -522,21 +662,29 @@ class BookPipelineService:
             page_summary = bool(re.fullmatch(
                 r'(?:这页|这一页|当前页)(?:讲了什么|说了什么|写了什么|原文|内容是什么|讲什么|内容)[？?。!！]*'
                 r'|what (?:does|is on) (?:this|the current) page(?: say)?[?]?', question.strip(), re.I))
+            visual_by_page = {}
             for page in pages:
                 text = page.get('text', '').strip()
-                if not text:
+                visual = _visual_terms(page)
+                visual_hits = len((queries - _QUERY_STOP) & _tokens(' '.join(visual))) if visual else 0
+                if not text and not visual_hits:
                     continue
-                score = len(queries & _tokens(text))
-                if page['page_id'] == page_id and (score > 0 or page_summary):
+                score = len(queries & _tokens(text)) if text else 0
+                if page['page_id'] == page_id and text and (score > 0 or page_summary):
                     score += 3
+                # Picture vocabulary is model-inferred: it can surface a page, never outrank its text.
+                score += .5 * visual_hits
                 if score:
                     ranked.append((score, page))
+                    visual_by_page[page['page_id']] = visual
             ranked.sort(key=lambda row: (-row[0], row[1]['page_num']))
             citations = []
             for _, page in ranked[:3]:
                 timing = next((p for p in timeline if p['page_id'] == page['page_id']), None)
-                cite = {'page_id': page['page_id'], 'page_num': page['page_num'], 'excerpt': page['text'][:1200],
+                cite = {'page_id': page['page_id'], 'page_num': page['page_num'], 'excerpt': page.get('text', '')[:1200],
                         'start': None, 'end': None, 'time_status': 'unavailable_until_export'}
+                if visual_by_page.get(page['page_id']):
+                    cite['visual'] = {'inferred': True, 'terms': visual_by_page[page['page_id']][:8]}
                 if timing:
                     cite.update(time_status='export_timeline', start=timing['book_start'], end=timing['book_end'],
                                 book_start=timing['book_start'], book_end=timing['book_end'],
@@ -565,10 +713,13 @@ class BookPipelineService:
                     citations = [cite for cite in citations if cite['page_id'] in cited_ids]
                     source = 'model_with_validated_citations'
             else:
-                answer = '原文摘录（未调用问答模型）：\n' + '\n'.join(f"第{c['page_num']}页：{c['excerpt']}" for c in citations)
+                answer = '原文摘录（未调用问答模型）：\n' + '\n'.join(
+                    f"第{c['page_num']}页：{c['excerpt'] or '（无文字）画面推断：' + '、'.join(c.get('visual', {}).get('terms', [])[:4])}"
+                    for c in citations)
                 source = 'extractive'
+            moments = search_moments(manifest, timeline, (queries - _QUERY_STOP) or queries, page_id, 3) if citations else []
             turn = {'turn_id': uuid.uuid4().hex, 'question': question, 'answer': answer,
-                    'answer_source': source, 'citations': citations, 'page_id': page_id,
+                    'answer_source': source, 'citations': citations, 'moments': moments, 'page_id': page_id,
                     'grounding_status': 'citations_validated_not_fact_checked' if source == 'model_with_validated_citations' else source,
                     **times, 'audio_ref': audio_ref, 'image_ref': image_ref, 'created_at': _now()}
             for kind, ref in (('audio', audio_ref), ('image', image_ref)):
@@ -578,7 +729,25 @@ class BookPipelineService:
             session['updated_at'] = _now()
             _atomic_json(session_path, session)
             return {'session_id': session_id, 'answer': answer, 'answer_source': source,
-                    'citations': citations, 'turn': turn}
+                    'citations': citations, 'moments': moments, 'turn': turn}
+
+    def timeline(self, book_id, manifest=None):
+        manifest = manifest or self.manifest(book_id)
+        exports = manifest.get('exports')
+        if not exports:
+            return []
+        return _read_json(self.asset(book_id, exports['timeline_path'])).get('pages', [])
+
+    def search(self, book_id, query, page_id=None, limit=5):
+        """Model-free, sub-second lookup of where something is said or seen in the book/film."""
+        if not isinstance(query, str) or not query.strip() or len(query) > 200:
+            raise PipelineError('检索内容需在 1 至 200 字内')
+        manifest = self.manifest(book_id)
+        if page_id is not None and page_id not in {p['page_id'] for p in manifest.get('pages', [])}:
+            raise PipelineError('页标识不存在')
+        tokens = _query_tokens(query) or _tokens(query)
+        return {'query': query, 'moments': search_moments(manifest, self.timeline(book_id, manifest), tokens, page_id, limit),
+                'film': bool(manifest.get('exports'))}
 
 
 def register_book_routes(app, config, adapters):
@@ -646,7 +815,16 @@ def register_book_routes(app, config, adapters):
 
     @app.post('/api/books/<book_id>/qa')
     def books_qa(book_id):
-        return jsonify(success=True, **service.qa(book_id, body()))
+        started = time.perf_counter()
+        result = service.qa(book_id, body())
+        return jsonify(success=True, **result, timing_ms=round((time.perf_counter() - started) * 1000, 1))
+
+    @app.get('/api/books/<book_id>/search')
+    def books_search(book_id):
+        started = time.perf_counter()
+        limit = min(max(request.args.get('limit', 5, type=int) or 5, 1), 10)
+        result = service.search(book_id, request.args.get('q', ''), request.args.get('page_id') or None, limit)
+        return jsonify(success=True, **result, timing_ms=round((time.perf_counter() - started) * 1000, 1))
 
     @app.get('/api/books/<book_id>/sessions/<session_id>')
     def books_session(book_id, session_id):

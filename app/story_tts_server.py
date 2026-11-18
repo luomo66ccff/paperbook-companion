@@ -2693,8 +2693,9 @@ def book_recognize(book_id):
     if page is None:
         raise PipelineError('页标识不存在', 404)
     source = value.get('source', 'image')
-    if source not in {'image', 'video'}:
-        raise PipelineError('识别来源必须为 image 或 video')
+    if source not in {'image', 'video', 'film'}:
+        raise PipelineError('识别来源必须为 image、video 或 film')
+    started = time.perf_counter()
     request_id = str(value.get('request_id', ''))[:100]
     frame_time = value.get('frame_time', 0)
     try:
@@ -2703,36 +2704,78 @@ def book_recognize(book_id):
         raise PipelineError('帧时间无效') from exc
     if not math.isfinite(frame_time) or frame_time < 0:
         raise PipelineError('帧时间无效')
+    if source == 'film':
+        # The film clock maps to exactly one page through the exported timeline.
+        if not manifest.get('exports'):
+            raise PipelineError('尚未合成整本影片', 409)
+        timeline = book_service.timeline(book_id, manifest)
+        row = next((item for item in timeline if item.get('video_start', item['book_start']) <= frame_time
+                    < item.get('video_end', item['book_end'])), None)
+        if row is None:
+            raise PipelineError('影片时间超出整片范围')
+        page_id = row['page_id']
+        page = next(item for item in manifest['pages'] if item['page_id'] == page_id)
     image_ref = page['image_path']
     image_path = book_service.asset(book_id, image_ref)
-    cached = source == 'image' and page.get('objects', {}).get('detections')
-    if cached:
+    cached_page = source == 'image' and page.get('objects', {}).get('detections')
+    reused = bool(cached_page)
+    if cached_page:
         objects = page['objects']
     else:
         if not get_capabilities()['vision']:
             raise PipelineError('视觉识别模型未配置；已保留原图阅读', 503)
+        frames = book_service.book_dir(book_id) / 'attachments' / 'frames'
+        frames.mkdir(parents=True, exist_ok=True)
+        relative_video = None
         if source == 'video':
             relative_video = page.get('media', {}).get('video', {}).get('path')
             if not relative_video:
                 raise PipelineError('此页尚无视频，请先生成页级媒体', 409)
+        elif source == 'film':
+            relative_video = manifest['exports']['video_path']
+        if relative_video:
             video_path = book_service.asset(book_id, relative_video)
-            frames = book_service.book_dir(book_id) / 'attachments' / 'frames'
-            frames.mkdir(parents=True, exist_ok=True)
-            image_path = frames / (uuid.uuid4().hex + '.png')
             with ImageCapture(str(video_path)) as capture:
                 if frame_time >= capture.duration:
-                    raise PipelineError('帧时间超出当前页短片范围')
-                if not capture.capture_frame_at_time(frame_time, str(image_path)):
-                    raise PipelineError('读取当前视频帧失败', 502)
+                    raise PipelineError('帧时间超出当前页短片范围' if source == 'video' else '影片时间超出整片范围')
+                # One cache entry per displayed frame: repeated taps on a paused frame are instant.
+                fps = capture.fps if capture.fps and capture.fps > 0 else 24
+                frame_index = int(math.floor(frame_time * fps + 1e-6))
+                key = hashlib.sha256(f'{relative_video}|{frame_index}|{image_model}'.encode()).hexdigest()[:24]
+                image_path = frames / (key + '.png')
+                if not image_path.is_file():
+                    temporary = frames / (key + '.' + uuid.uuid4().hex[:8] + '.png')
+                    if not capture.capture_frame_at_time(frame_index / fps, str(temporary)):
+                        raise PipelineError('读取当前视频帧失败', 502)
+                    os.replace(temporary, image_path)
+        else:
+            key = hashlib.sha256(f"{image_ref}|{hashlib.sha256(image_path.read_bytes()).hexdigest()}|{image_model}".encode()).hexdigest()[:24]
+        cache_file = frames / (key + '.json')
+        objects = None
+        if cache_file.is_file():
+            try:
+                objects = json.loads(cache_file.read_text('utf-8'))
+                reused = isinstance(objects, dict) and objects.get('coordinate_space') == 'pixel'
+            except (OSError, ValueError):
+                objects = None
+            if not reused:
+                objects = None
+        if objects is None:
+            try:
+                objects = analyzer.call_with_metadata({'image_path': str(image_path), 'max_objects': 12,
+                           'source_id': f'{book_id}/{page_id}/{source}/{frame_time:.3f}'})
+            except Exception as exc:
+                raise PipelineError('视觉识别失败，请检查服务配置或重试', 502) from exc
+            if isinstance(objects, dict) and objects.get('coordinate_space') == 'pixel':
+                temporary = cache_file.with_name(cache_file.name + '.' + uuid.uuid4().hex[:8])
+                temporary.write_text(json.dumps(objects, ensure_ascii=False), 'utf-8')
+                os.replace(temporary, cache_file)
+        if relative_video:
             image_ref = image_path.relative_to(book_service.book_dir(book_id)).as_posix()
-        try:
-            objects = analyzer.call_with_metadata({'image_path': str(image_path), 'max_objects': 12,
-                       'source_id': f'{book_id}/{page_id}/{source}/{frame_time:.3f}'})
-        except Exception as exc:
-            raise PipelineError('视觉识别失败，请检查服务配置或重试', 502) from exc
     return jsonify(success=True, book_id=book_id, page_id=page_id, request_id=request_id,
-                   source=source, frame_time=frame_time, objects=objects,
-                   image_ref=image_ref, image_url=book_service.asset_url(book_id, image_ref))
+                   source=source, frame_time=frame_time, objects=objects, cached=reused,
+                   image_ref=image_ref, image_url=book_service.asset_url(book_id, image_ref),
+                   timing_ms=round((time.perf_counter() - started) * 1000, 1))
 
 
 @app.post('/api/books/<book_id>/speak')

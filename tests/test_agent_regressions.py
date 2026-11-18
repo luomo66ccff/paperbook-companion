@@ -97,6 +97,7 @@ def test_env_storage_root_is_loaded_before_configuration(tmp_path):
     import os
     environment = dict(os.environ)
     environment.pop('TARGET_DIR', None)
+    environment.pop('PAPERBOOK_SKIP_DOTENV', None)  # this test loads its own temporary .env on purpose
     result = subprocess.run([sys.executable, '-c',
                              'import sys;sys.path.insert(0,sys.argv[1]);import config;print(config.TARGET_DIR)', str(tmp_path)],
                             env=environment, capture_output=True, text=True, encoding='utf-8', check=True)

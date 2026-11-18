@@ -6,6 +6,11 @@ from urllib.parse import urlparse
 import pytest
 import requests
 
+import os
+
+# Never read a developer's app/.env (real, paid provider keys) during tests.
+os.environ['PAPERBOOK_SKIP_DOTENV'] = '1'
+
 APP = Path(__file__).resolve().parents[1] / 'app'
 if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))

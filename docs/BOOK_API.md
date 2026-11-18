@@ -23,9 +23,10 @@
 | GET `/api/jobs/<job_id>` | 无 | `job` 状态、进度、错误和结果 |
 | POST `/api/jobs/<job_id>/retry` | JSON 对象 | 202：同一任务显式重试 |
 | POST `/api/books/<book_id>/export` | JSON：可选 `force, video_options` | 202：整片任务 |
-| POST `/api/books/<book_id>/recognize` | JSON：`page_id, source, frame_time, request_id` | 显式坐标 `objects` 与上下文回传 |
+| POST `/api/books/<book_id>/recognize` | JSON：`page_id, source(image/video/film), frame_time, request_id` | 显式坐标 `objects`、`cached`、`timing_ms` 与上下文回传 |
 | POST `/api/books/<book_id>/speak` | JSON：`text, voice`，可选 `language` | `audio_url, audio_ref, duration` |
-| POST `/api/books/<book_id>/qa` | JSON：问题、会话与可选页/时间/媒体引用 | `session_id, answer, answer_source, citations, turn` |
+| POST `/api/books/<book_id>/qa` | JSON：问题、会话与可选页/时间/媒体引用 | `session_id, answer, answer_source, citations, moments, turn, timing_ms` |
+| GET `/api/books/<book_id>/search` | 查询：`q`（1–200 字），可选 `page_id, limit`(1–10) | `moments, film, timing_ms`；不调用模型 |
 | GET `/api/books/<book_id>/sessions/<session_id>` | 无 | `session` 及其 `turns` |
 | POST `/api/books/<book_id>/attachments` | multipart：`file, kind=audio/image` | `ref, url` |
 | POST `/api/books/<book_id>/transcribe` | multipart：`file`（兼容 `audio`），可选 `language` | `text, audio_ref, audio_url` |
@@ -99,7 +100,7 @@ manifest `schema_version=1` 包含：
 {"page_id":"p0001","source":"video","frame_time":1.25,"request_id":"click-001"}
 ```
 
-`source` 为 `image` 或 `video`；视频按该页原短片的 `frame_time` 截帧。返回 `book_id,page_id,request_id,source,frame_time,image_ref,image_url`，以及：
+`source` 为 `image`、`video` 或 `film`。`video` 按该页原短片的 `frame_time` 截帧；`film` 的 `frame_time` 是整片时钟，服务端按时间轴 `video_start <= t < video_end` 定位页（返回的 `page_id` 以此为准），从 `book.mp4` 截帧。视频帧按「媒体路径 + 帧序号 + 视觉模型」缓存截图与识别结果（`attachments/frames/`），同一暂停画面重复点击不再调用视觉模型并返回 `cached=true`；原图没有页级检测结果时同样按图像哈希缓存。返回 `book_id,page_id,request_id,source,frame_time,image_ref,image_url`，以及：
 
 ```json
 {"coordinate_space":"pixel","reference_width":864,"reference_height":480,"source_id":"frame-source","detections":[{"label":"小兔子","box":[100,100,600,400]}]}
@@ -133,7 +134,7 @@ frame_time = (book_time - video_start) % source_video_duration
 video_start <= book_time < video_end
 ```
 
-页短片播放器知道 `frame_time`，却不自动知道整片 `book_time`。当前工作台不会用短片时间伪造整片时间。
+页短片播放器知道 `frame_time`，却不自动知道整片 `book_time`。工作台只在「整本影片」模式下发送 `book_time`（整片播放器的 currentTime），页动画模式只发送 `frame_time`，不用短片时间伪造整片时间。
 
 ## 问答、引用与多媒体会话
 
@@ -147,6 +148,18 @@ QA JSON 必填 `question`（1至4000字），可选 `session_id,page_id,book_tim
 - `model_abstained`：模型明确缺少依据，返回弃答。
 - `no_evidence`：未找到足够原文证据，不调用模型。
 - `extractive`：未配置问答模型，明确返回原文摘录。
+
+检索在原文之外加入模型推断的画面词（`scene_analysis.data` 与 `objects.detections` 标签），权重为原文的一半：只能让无字页被找到，不能压过原文。命中时 citation 附 `visual: {inferred: true, terms}`，无字页 `excerpt` 为空串。
+
+## 视频内检索 moments
+
+`search` 与 `qa` 返回 `moments`：`{kind, page_id, page_num, text, start, end, book_start, book_end, inferred, score}`。
+
+- `speech`：来自实测句子 WAV，`start/end` 为本页配音时间；整片导出后补 `book_start/book_end`。
+- `text`：尚未配音的原文句，没有时间。
+- `visual`：模型推断的画面命中，覆盖整页画面范围，`inferred=true`。
+
+查询会先去掉「什么、哪里、时候」等提问用语，再按 bigram 匹配，当前页同分优先。前端点击 moment 时，有整片就跳到 `book_start` 播放，否则翻到该页并从句子 `start` 播放朗读。
 
 citation 含 `page_id,page_num,excerpt,start,end,time_status`；导出可用后补 `book_start/book_end` 与 `video_start/video_end`。尚无导出时，时间范围为空并标明不可用，不能估算补齐。
 

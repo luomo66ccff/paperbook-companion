@@ -21,7 +21,9 @@ def _load_env_file(path):
             os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
-_load_env_file(os.path.join(_BASE_DIR, ".env"))
+# Tests set PAPERBOOK_SKIP_DOTENV=1 so a developer's real keys never leak into hermetic runs.
+if os.environ.get("PAPERBOOK_SKIP_DOTENV", "").lower() not in ("1", "true", "yes"):
+    _load_env_file(os.path.join(_BASE_DIR, ".env"))
 TARGET_DIR = os.path.abspath(os.path.expanduser(os.environ.get("TARGET_DIR") or _BASE_DIR))
 
 

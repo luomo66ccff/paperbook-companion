@@ -49,8 +49,21 @@ def main():
     from PIL import Image
     from coordinates import object_contract
 
+    fixture_pdf = data_dir / 'controlled-mixed.pdf'
+
     class ControlledReader(PDFBookReader):
+        is_fixture = False
+
+        def read_book(self, pdf_path, *args, **kwargs):
+            self.is_fixture = Path(pdf_path).read_bytes() == fixture_pdf.read_bytes()
+            return super().read_book(pdf_path, *args, **kwargs)
+
         def ocr_page(self, path):
+            # Only the bundled fixture has fixed transcripts. Any other book (e.g. the
+            # competition samples) reaches OCR only for pages without a text layer,
+            # which this controlled harness reports as wordless instead of inventing text.
+            if not self.is_fixture:
+                return '[无文字页面]'
             return {'p0001': '小兔子把红苹果送给小狐狸。', 'p0002': '小狐狸喜欢红苹果。',
                     'p0003': '[无文字页面]'}[Path(path).stem]
         def verify_ocr(self, path, text):

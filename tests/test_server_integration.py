@@ -312,3 +312,61 @@ def test_optional_sound_effects_do_not_disable_ordinary_narration(server, monkey
     assert calls == ['普通朗读不需要音效服务。']
     assert client.get(result.get_json()['audio_url']).status_code == 200
     assert not Path(result.get_json()['audio_path']).is_absolute()
+
+
+def test_film_frame_recognition_maps_book_time_and_reuses_cached_frames(server, monkeypatch, tmp_path):
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg or not shutil.which('ffprobe'):
+        pytest.skip('FFmpeg required')
+    client, book_id = import_book(server)
+    clip = tmp_path / 'clip.mp4'
+    subprocess.run([ffmpeg, '-y', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=blue:s=160x120:r=24:d=0.5',
+                    '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(clip)], check=True, capture_output=True)
+
+    def synthesize(text, voice, output_path, language):
+        with wave.open(str(output_path), 'wb') as stream:
+            stream.setparams((1, 2, 24000, 0, 'NONE', 'not compressed'))
+            stream.writeframes(b'\1\0' * 12000)
+        return output_path
+
+    def generate(image_path, prompt, output_path, options):
+        shutil.copyfile(clip, output_path)
+        return output_path
+
+    caps = {**server.get_capabilities(), 'vision': True, 'tts': True, 'video': True}
+    monkeypatch.setattr(server, 'get_capabilities', lambda: dict(caps))
+    server.book_service.adapters.update(synthesize=synthesize, video_generate=generate, capabilities=lambda: dict(caps))
+    manifest = server.book_service.manifest(book_id)
+    manifest['pages'][1]['text_status'] = 'empty'  # the fast-mode drawing page, confirmed wordless
+    server.book_service._save_manifest(book_id, manifest)
+    media = client.post(f'/api/books/{book_id}/media', json={'voice': 'test'}).get_json()
+    done = server.book_service.wait_for_job(media['job_id'])
+    assert done['status'] == 'succeeded', done['error']
+    export = client.post(f'/api/books/{book_id}/export', json={}).get_json()
+    assert server.book_service.wait_for_job(export['job_id'])['status'] == 'succeeded'
+    from coordinates import object_contract
+    from PIL import Image
+    calls = []
+
+    def analyze(params):
+        calls.append(params['source_id'])
+        with Image.open(params['image_path']) as image:
+            width, height = image.size
+        return object_contract({'detections': [{'label': '小兔子<rabbit>', 'box': [10, 10, 60, 60]}]}, width, height, params['source_id'])
+
+    monkeypatch.setattr(server.analyzer, 'call_with_metadata', analyze)
+    timeline = server.book_service.timeline(book_id)
+    second_start = timeline[1]['video_start']
+    first = client.post(f'/api/books/{book_id}/recognize', json={
+        'page_id': 'p0001', 'source': 'film', 'frame_time': second_start + .05, 'request_id': 'film-1'}).get_json()
+    assert first['success'] and first['page_id'] == 'p0002' and first['source'] == 'film' and first['cached'] is False
+    assert first['objects']['reference_width'] == 1280 and first['image_ref'].startswith('attachments/frames/')
+    again = client.post(f'/api/books/{book_id}/recognize', json={
+        'page_id': 'p0002', 'source': 'film', 'frame_time': second_start + .05, 'request_id': 'film-2'}).get_json()
+    assert again['cached'] is True and again['request_id'] == 'film-2' and len(calls) == 1
+    assert client.get(again['image_url']).status_code == 200
+    assert client.post(f'/api/books/{book_id}/recognize', json={
+        'page_id': 'p0001', 'source': 'film', 'frame_time': 999}).status_code == 400
+    page_clip = client.post(f'/api/books/{book_id}/recognize', json={
+        'page_id': 'p0001', 'source': 'video', 'frame_time': .1}).get_json()
+    assert page_clip['page_id'] == 'p0001' and page_clip['objects']['reference_width'] == 160 and len(calls) == 2
