@@ -386,7 +386,7 @@
     async function selectBook(bookId) {
       if (!bookId || !idPattern.test(bookId)) return;
       state.selection++; stopRecording(true); pausePage(); invalidate('已切换绘本。'); clearAttachments();
-      state.bookId = bookId; state.book = null; state.pageIndex = 0; state.mediaKey = ''; state.prefer = 'film';
+      state.bookId = bookId; state.book = null; state.pageIndex = 0; state.mediaKey = ''; state.prefer = 'film'; setShelf('open');
       state.timeline = null; state.timelineURL = ''; state.filmURL = ''; state.detections.clear(); state.anchors.clear(); state.spoken.clear(); cancelPrefetch(); $('momentResults').replaceChildren();
       state.sessionId = state.sessions[bookId] || ''; state.lastSpoken = null; $('replaySpoken').hidden = true;
       $('chatMessages').replaceChildren(node('p', '你想知道故事里的什么呢？', 'empty'));
@@ -754,13 +754,30 @@
         state.recording = recording; recorder.start(); updateControls();
       } catch (_) { notice('没有获得麦克风权限，可以改用上传语音文件或文字提问。', true); updateControls(); }
     }
+    /* Welcome screen and header shortcut: pick or drop a PDF and import it with the toolbox defaults. */
+    function setShelf(value) { document.body.dataset.shelf = value; }
+    function quickPick() { state.quickImport = true; $('pdfFile').click(); }
+    function quickImport(files) {
+      const file = files && files[0];
+      if (!file || !(/\.pdf$/i.test(file.name) || file.type === 'application/pdf')) { notice('请选择 PDF 格式的绘本文件。', true); return; }
+      if (files !== $('pdfFile').files) { const transfer = new DataTransfer(); transfer.items.add(file); $('pdfFile').files = transfer.files; }
+      $('importForm').requestSubmit();
+    }
+    $('welcomeImport').addEventListener('click', quickPick); $('addBook').addEventListener('click', quickPick);
+    $('pdfFile').addEventListener('change', () => { if (state.quickImport) { state.quickImport = false; if ($('pdfFile').files.length) quickImport($('pdfFile').files); } });
+    $('pdfFile').addEventListener('cancel', () => { state.quickImport = false; });
+    ['dragenter', 'dragover'].forEach(type => $('dropZone').addEventListener(type, event => { event.preventDefault(); $('dropZone').classList.add('is-over'); }));
+    ['dragleave', 'drop'].forEach(type => $('dropZone').addEventListener(type, () => $('dropZone').classList.remove('is-over')));
+    $('dropZone').addEventListener('drop', event => { event.preventDefault(); if (!document.body.classList.contains('importing')) quickImport(event.dataTransfer && event.dataTransfer.files); });
+    document.querySelectorAll('[data-open-grownup]').forEach(link => link.addEventListener('click', () => { $('grownup').open = true; }));
     $('importForm').addEventListener('submit', async event => {
       event.preventDefault(); const file = $('pdfFile').files[0]; if (!file) return; $('importButton').disabled = true;
+      document.body.classList.add('importing'); $('welcomeImport').disabled = $('addBook').disabled = true;
       try {
         const form = new FormData(); form.append('file', file); form.append('mode', $('readMode').value); form.append('verify_ocr', String($('verifyOcr').checked));
         const result = await api('/api/books/import', { method: 'POST', body: form });
         await loadBooks(); await selectBook(result.book_id); trackJob(result.book_id, result.job_id, 'import'); $('pdfFile').value = ''; notice('绘本已收到，正在整理书页。');
-      } catch (error) { notice(error.message, true); } finally { $('importButton').disabled = false; }
+      } catch (error) { notice(error.message, true); } finally { $('importButton').disabled = false; document.body.classList.remove('importing'); $('welcomeImport').disabled = $('addBook').disabled = false; }
     });
     $('readMode').addEventListener('change', () => { const fast = $('readMode').value === 'fast'; $('verifyOcr').disabled = fast; if (fast) $('verifyOcr').checked = false; });
     $('bookSelect').addEventListener('change', () => { if ($('bookSelect').value) selectBook($('bookSelect').value); });
@@ -837,8 +854,8 @@
       try {
         const books = await loadBooks(); let saved = ''; try { saved = localStorage.getItem('paperbook.activeBook') || ''; } catch (_) {}
         const selected = books.find(book => book.book_id === saved) || books[0];
-        if (selected) await selectBook(selected.book_id); else notice('欢迎，导入一本 PDF 绘本开始阅读吧。');
-      } catch (error) { notice(error.message, true); }
+        if (selected) await selectBook(selected.book_id); else { setShelf('empty'); notice('欢迎！导入一本 PDF 绘本，就能开始阅读啦。'); }
+      } catch (error) { if (!state.bookId) setShelf('empty'); notice(error.message, true); }
     })();
   }
   return { sameObject, containRect, mapClickToSource, boxToDisplay, hitDetection, sameContext, responseMatches, shouldResume, formatTime,

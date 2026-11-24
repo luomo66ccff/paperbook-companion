@@ -3,13 +3,15 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#FFF7E8">
+  <meta name="theme-color" content="#FFF7E8" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1F1813" media="(prefers-color-scheme: dark)">
+  <meta name="color-scheme" content="light dark">
   <title>纸书智伴 · 和小页一起读绘本</title>
   <link rel="stylesheet" href="/book_reader.css">
   <script src="/book_ui.js" defer></script>
 </head>
-<body>
-  <a class="skip-link" href="#mediaStage">跳到绘本画面</a>
+<body data-shelf="loading">
+  <a class="skip-link" href="#main">跳到主要内容</a>
   <header class="site-header">
     <a class="brand" href="/books">
       <svg class="mascot" viewBox="0 0 64 64" aria-hidden="true" focusable="false">
@@ -22,37 +24,78 @@
       <span class="brand-text"><b>纸书智伴</b><small>和小页一起读绘本</small></span>
     </a>
     <nav class="site-nav" aria-label="阅读与创作入口">
-      <a class="nav-pill" href="./quick"><span aria-hidden="true">⚡</span> 单页速读</a>
-      <a class="nav-pill" href="/tts_v2.html"><span aria-hidden="true">✨</span> 主题故事创作 ↗</a>
+      <a class="nav-link" href="./quick"><span class="nav-ico" aria-hidden="true">⚡</span><span>单页速读</span></a>
+      <a class="nav-link" href="/tts_v2.html"><span class="nav-ico" aria-hidden="true">✨</span><span>故事创作<span class="nav-ext" aria-hidden="true"> ↗</span></span></a>
     </nav>
     <div class="shelf-line">
-      <label for="bookSelect"><span aria-hidden="true">📚</span> 我的书架</label>
+      <label for="bookSelect"><span class="shelf-ico" aria-hidden="true">📚</span><span class="shelf-text">我的书架</span></label>
       <select id="bookSelect"><option value="">选择一本绘本</option></select>
-      <button id="refreshBooks" type="button" class="quiet">刷新</button>
+      <button id="refreshBooks" type="button" class="quiet icon-btn" aria-label="刷新书架" title="刷新书架"><span aria-hidden="true">↻</span></button>
+      <button id="addBook" type="button" class="secondary add-book" aria-label="导入 PDF 绘本" title="导入 PDF 绘本"><span aria-hidden="true">＋</span><span class="add-text"> 导入</span></button>
     </div>
   </header>
 
   <div class="notice-wrap"><p id="appStatus" class="notice" role="status" aria-live="polite">正在打开书架…</p></div>
 
-  <main class="workspace">
+  <main id="main" class="workspace" tabindex="-1">
+    <section id="welcome" class="welcome" aria-labelledby="welcomeTitle">
+      <div class="welcome-copy">
+        <p class="eyebrow">第一次来？三步开始</p>
+        <h1 id="welcomeTitle">把一本 PDF 绘本，<br>变成会说话的故事书</h1>
+        <p class="welcome-lead">导入后，小页会整理书页、读出文字，还能陪孩子点一点画面、问问题。</p>
+        <div id="dropZone" class="drop-zone">
+          <svg class="drop-art" viewBox="0 0 120 96" aria-hidden="true" focusable="false">
+            <rect x="18" y="14" width="64" height="76" rx="8" fill="#FFF" stroke="#3A2A1C" stroke-width="3" transform="rotate(-6 50 52)"/>
+            <rect x="36" y="8" width="64" height="76" rx="8" fill="#FFE7A3" stroke="#3A2A1C" stroke-width="3"/>
+            <path d="M48 30h40M48 42h40M48 54h26" stroke="#3A2A1C" stroke-width="3" stroke-linecap="round" opacity=".55"/>
+            <circle cx="92" cy="74" r="17" fill="#21804F" stroke="#3A2A1C" stroke-width="3"/>
+            <path d="M92 66v16M84 74h16" stroke="#FFF" stroke-width="4" stroke-linecap="round"/>
+          </svg>
+          <button id="welcomeImport" type="button" class="primary big">
+            <span class="when-idle"><span aria-hidden="true">📥</span> 导入 PDF 绘本</span>
+            <span class="when-busy">正在上传，请稍等…</span>
+          </button>
+          <p class="drop-hint"><span class="drag-only">或者把 PDF 文件拖到这里 · </span>默认自动识字，书页整理好就能读</p>
+          <a class="tiny-link" href="#grownup" data-open-grownup>想换识字方式？打开大人工具箱</a>
+        </div>
+      </div>
+      <ol class="steps" aria-label="使用步骤">
+        <li class="step step-1">
+          <span class="step-art" aria-hidden="true">📖</span>
+          <span class="step-num" aria-hidden="true">1</span>
+          <div><h2>导入绘本</h2><p>选一份 PDF，书页会自动排好队。</p></div>
+        </li>
+        <li class="step step-2">
+          <span class="step-art" aria-hidden="true">👆</span>
+          <span class="step-num" aria-hidden="true">2</span>
+          <div><h2>点一点画面</h2><p>点到小兔子，小页就念出它的名字。</p></div>
+        </li>
+        <li class="step step-3">
+          <span class="step-art" aria-hidden="true">💬</span>
+          <span class="step-num" aria-hidden="true">3</span>
+          <div><h2>问问小页</h2><p>小页翻回原书找答案，还能跳到那一页。</p></div>
+        </li>
+      </ol>
+    </section>
+
     <div class="reader-layout">
       <aside class="pages-panel card" aria-label="绘本页列表">
-        <div class="panel-title"><h2>书页</h2><span id="pageCount">尚未选择</span></div>
+        <div class="panel-title"><h2>书页</h2><span id="pageCount" class="count-chip">尚未选择</span></div>
         <nav id="pageList" class="page-list" aria-label="选择书页"><p class="empty">导入或选择绘本后，所有书页会出现在这里。</p></nav>
       </aside>
 
       <section class="reading-panel card" aria-labelledby="bookTitle">
         <div class="reader-heading">
-          <div><p class="eyebrow">一起读绘本</p><h1 id="bookTitle">故事，正等着翻开</h1></div>
+          <div class="reader-title"><p class="eyebrow">一起读绘本</p><h1 id="bookTitle">故事，正等着翻开</h1></div>
           <span id="bookState" class="badge">请选择绘本</span>
         </div>
         <div class="view-controls">
           <div class="segmented" role="group" aria-label="画面选择">
-            <button id="showImage" type="button" aria-pressed="true"><span aria-hidden="true">🖼</span> 原图</button>
-            <button id="showVideo" type="button" aria-pressed="false" disabled><span aria-hidden="true">🎬</span> 页动画</button>
-            <button id="showFilm" type="button" aria-pressed="false" disabled><span aria-hidden="true">🎞</span> 整本影片</button>
+            <button id="showImage" type="button" aria-pressed="true"><span class="seg-ico" aria-hidden="true">🖼</span><span>原图</span></button>
+            <button id="showVideo" type="button" aria-pressed="false" disabled><span class="seg-ico" aria-hidden="true">🎬</span><span>页动画</span></button>
+            <button id="showFilm" type="button" aria-pressed="false" disabled><span class="seg-ico" aria-hidden="true">🎞</span><span>整本影片</span></button>
           </div>
-          <span id="mediaState" class="subtle">没有动画时也能看原图哦</span>
+          <span id="mediaState" class="subtle media-state">没有动画时也能看原图哦</span>
         </div>
         <div id="mediaStage" class="media-stage" tabindex="0" data-source="image" aria-label="绘本画面，点一点认识里面的东西">
           <div id="stageEmpty" class="stage-empty">
@@ -62,8 +105,8 @@
               <ellipse class="mascot-eye" cx="21" cy="30" rx="3" ry="4" fill="#3A2A1C"/><ellipse class="mascot-eye" cx="43" cy="30" rx="3" ry="4" fill="#3A2A1C"/>
               <path d="M26 40q6 5 12 0" fill="none" stroke="#3A2A1C" stroke-width="3" stroke-linecap="round"/>
             </svg>
-            <p><b>选一本书，开始今天的阅读吧！</b></p>
-            <p class="subtle">书架里还没有书？<a href="#grownup">请大人帮你打开一本绘本</a></p>
+            <p><b>马上翻开，稍等一下～</b></p>
+            <p class="subtle">书架里还没有书？<a href="#grownup" data-open-grownup>请大人帮你打开一本绘本</a></p>
           </div>
           <img id="pageImage" alt="" hidden>
           <video id="pageVideo" muted playsinline preload="metadata" hidden></video>
@@ -80,9 +123,9 @@
           <details><summary>📄 看看本页原文</summary><p id="pageText"></p></details>
         </div>
         <div class="playback-controls">
-          <button id="prevPage" type="button" aria-label="上一页" disabled>◀ 上一页</button>
+          <button id="prevPage" type="button" class="secondary" aria-label="上一页" disabled><span aria-hidden="true">◀</span><span class="pb-label"> 上一页</span></button>
           <button id="playPause" type="button" class="primary play" disabled>播放</button>
-          <button id="nextPage" type="button" aria-label="下一页" disabled>下一页 ▶</button>
+          <button id="nextPage" type="button" class="secondary" aria-label="下一页" disabled><span class="pb-label">下一页 </span><span aria-hidden="true">▶</span></button>
         </div>
         <div class="seek-line">
           <span id="currentTime">0:00</span>
@@ -100,30 +143,36 @@
             <input id="momentQuery" type="search" maxlength="200" placeholder="比如：红苹果、小狐狸" autocomplete="off" disabled>
             <button id="momentSearch" type="submit" class="go" disabled>找一找</button>
           </div>
-          <p class="subtle">不用等大模型：直接找到说到它、画到它的那一句，点一下就从那里开始播。</p>
+          <p class="subtle">直接找到说到它、画到它的那一句，点一下就从那里开始播。</p>
         </form>
         <div id="momentResults" class="moment-results" aria-live="polite"></div>
       </section>
 
       <aside class="chat-panel card" aria-labelledby="chatTitle">
-        <div class="panel-title"><h2 id="chatTitle"><span aria-hidden="true">💬</span> 问问小页</h2><button id="newSession" type="button" class="quiet" disabled>新对话</button></div>
-        <p class="chat-intro subtle">小页会翻回书里找答案，找不到也会老实告诉你～</p>
+        <div class="panel-title chat-head">
+          <h2 id="chatTitle"><span class="chat-avatar" aria-hidden="true">💬</span> 问问小页</h2>
+          <button id="newSession" type="button" class="quiet" disabled>新对话</button>
+        </div>
+        <p class="chat-intro">小页会翻回书里找答案，找不到也会老实告诉你～</p>
         <div id="chatMessages" class="chat-messages" aria-live="polite"><p class="empty">你想知道故事里的什么呢？</p></div>
         <div id="pendingAttachments" class="pending-attachments"></div>
         <form id="questionForm" class="question-form">
           <label for="questionInput">我的问题</label>
           <textarea id="questionInput" rows="2" maxlength="4000" placeholder="比如：红苹果送给了谁？" disabled></textarea>
-          <label class="checkbox"><input id="speakAnswers" type="checkbox" checked>把回答读给我听</label>
           <div class="button-row ask-row">
             <button id="sendQuestion" type="submit" class="primary" disabled>✏️ 提问</button>
             <button id="recordQuestion" type="button" class="mic" disabled>🎙 说一说</button>
           </div>
+          <label class="checkbox"><input id="speakAnswers" type="checkbox" checked>把回答读给我听</label>
         </form>
-        <p id="recordingStatus" class="subtle">语音提问需要麦克风和识别功能。</p>
-        <div class="attachment-controls">
-          <label class="attachment-label">🎧 上传语音提问<input id="audioUpload" type="file" accept="audio/*,.wav,.webm,.mp3,.m4a,.ogg,.flac" disabled></label>
-          <label class="attachment-label">🖼 给问题附一张图<input id="imageUpload" type="file" accept="image/png,image/jpeg,image/webp" disabled></label>
-        </div>
+        <p id="recordingStatus" class="subtle recording-status">语音提问需要麦克风和识别功能。</p>
+        <details class="more-ask">
+          <summary>📎 更多提问方式</summary>
+          <div class="attachment-controls">
+            <label class="attachment-label">🎧 上传语音提问<input id="audioUpload" type="file" accept="audio/*,.wav,.webm,.mp3,.m4a,.ogg,.flac" disabled></label>
+            <label class="attachment-label">🖼 给问题附一张图<input id="imageUpload" type="file" accept="image/png,image/jpeg,image/webp" disabled></label>
+          </div>
+        </details>
       </aside>
     </div>
 
@@ -149,7 +198,7 @@
             <label>朗读声音<select id="voice"><option value="xiaoyuan">晓晓 · 温柔女声</option><option value="xiaosi">晓伊 · 轻快女声</option><option value="niudun">云健 · 明亮男声</option><option value="oula">云扬 · 沉稳男声</option><option value="en_F001">Jenny · 英语</option></select></label>
             <label class="checkbox"><input id="forceMedia" type="checkbox">重新制作已有内容</label>
           </div>
-          <div class="button-row"><button id="generateBook" type="button" disabled>准备整本</button><button id="generatePage" type="button" disabled>只准备这一页</button><button id="exportBook" type="button" class="go" disabled>合成完整影片</button></div>
+          <div class="button-row"><button id="generateBook" type="button" class="secondary" disabled>准备整本</button><button id="generatePage" type="button" class="secondary" disabled>只准备这一页</button><button id="exportBook" type="button" class="go" disabled>合成完整影片</button></div>
           <p id="generationHint" class="subtle">阅读原图无需等待整本制作完成。</p>
           <div id="exportLinks" class="export-links"></div>
         </section>
