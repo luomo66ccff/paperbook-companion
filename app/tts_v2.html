@@ -2952,12 +2952,25 @@
             bookshelfData.forEach(book => {
                 const tag = document.createElement('span');
                 tag.className = 'bookshelf-tag';
-                tag.innerHTML = `
-                    <span class="tag-icon">📖</span>
-                    <span class="tag-name">${book.name}</span>
-                    <span class="remove-btn" title="移除书架" onclick="event.stopPropagation(); removeFromBookshelf('${book.session_dir}')">×</span>
-                `;
-                tag.onclick = () => fillFromBookshelf(book);
+                const icon = document.createElement('span');
+                icon.className = 'tag-icon';
+                icon.textContent = '📖';
+
+                const name = document.createElement('span');
+                name.className = 'tag-name';
+                name.textContent = book.name;
+
+                const remove = document.createElement('span');
+                remove.className = 'remove-btn';
+                remove.title = '移除书架';
+                remove.textContent = '×';
+                remove.addEventListener('click', event => {
+                    event.stopPropagation();
+                    removeFromBookshelf(book.session_dir);
+                });
+
+                tag.append(icon, name, remove);
+                tag.addEventListener('click', () => fillFromBookshelf(book));
                 examplesContainer.appendChild(tag);
             });
         }
@@ -6696,7 +6709,9 @@
             // 添加问题
             const questionMsg = document.createElement('div');
             questionMsg.className = 'assistant-message from-user';
-            questionMsg.innerHTML = `<strong>❓ 问题：</strong><br>${qa.question}`;
+            const questionLabel = document.createElement('strong');
+            questionLabel.textContent = '❓ 问题：';
+            questionMsg.append(questionLabel, document.createElement('br'), String(qa.question));
             messagesContainer.appendChild(questionMsg);
             scrollAssistantToBottom();
             
@@ -6708,7 +6723,9 @@
                 // 问题播放完后添加答案到对话框
                 const answerMsg = document.createElement('div');
                 answerMsg.className = 'assistant-message from-assistant';
-                answerMsg.innerHTML = `<strong>💡 答案：</strong><br>${qa.answer}`;
+                const answerLabel = document.createElement('strong');
+                answerLabel.textContent = '💡 答案：';
+                answerMsg.append(answerLabel, document.createElement('br'), String(qa.answer));
                 messagesContainer.appendChild(answerMsg);
                 scrollAssistantToBottom();
             });
@@ -7639,7 +7656,7 @@
         // 渲染试卷
         function renderExam(preserveAnswers = false) {
             const container = document.getElementById('examQuestions');
-            container.innerHTML = '';
+            container.textContent = '';
             
             // 如果不需要保留答案，才重置
             if (!preserveAnswers) {
@@ -7654,17 +7671,27 @@
                 const questionText = question['问题'] || question.question || '未知问题';
                 const options = question['选项'] || question.options || {};
                 
-                qDiv.innerHTML = `
-                    <div class="question-number">第 ${index + 1} 题（20分）</div>
-                    <div class="question-text">${questionText}</div>
-                    <div class="question-options" id="options-${index}">
-                        ${Object.entries(options).map(([key, value]) => `
-                            <button class="option-btn" data-question="${index}" data-answer="${key}" onclick="selectOption(${index}, '${key}')">
-                                <strong>${key}.</strong> ${value}
-                            </button>
-                        `).join('')}
-                    </div>
-                `;
+                const number = document.createElement('div');
+                number.className = 'question-number';
+                number.textContent = `第 ${index + 1} 题（20分）`;
+                const text = document.createElement('div');
+                text.className = 'question-text';
+                text.textContent = questionText;
+                const optionsDiv = document.createElement('div');
+                optionsDiv.className = 'question-options';
+                optionsDiv.id = `options-${index}`;
+                Object.entries(options).forEach(([key, value]) => {
+                    const button = document.createElement('button');
+                    button.className = 'option-btn';
+                    button.dataset.question = String(index);
+                    button.dataset.answer = key;
+                    button.addEventListener('click', () => selectOption(index, key));
+                    const label = document.createElement('strong');
+                    label.textContent = `${key}.`;
+                    button.append(label, ` ${value}`);
+                    optionsDiv.appendChild(button);
+                });
+                qDiv.append(number, text, optionsDiv);
                 
                 container.appendChild(qDiv);
             });

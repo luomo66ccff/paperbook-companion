@@ -1,12 +1,13 @@
 from flask import Flask, request, jsonify, send_file, send_from_directory
-from flask_cors import CORS
 import requests
 import base64
 import binascii
+import errno
 import io
 import threading
 import time
 import os
+import shutil
 import json
 import sys
 import webbrowser
@@ -18,14 +19,18 @@ from PIL import Image as PILImage
 from flask import Response
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pydantic import BaseModel
 from typing import Optional, List, Dict
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 # 关闭Flask/Werkzeug的HTTP请求日志
 import logging
 import hashlib
+from hmac import compare_digest
+from ipaddress import ip_address
 import math
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 import uuid
 
 from ai_story_generate import GeminiAIStroyWriter, parse_output, Gemini3ProAgent, split_sfx_text, parse_list, parse_story_pages
@@ -52,6 +57,7 @@ import volc_asr
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
+logger = logging.getLogger(__name__)
 
 
 def _remote_asr(audio_path, language=None):
@@ -102,8 +108,111 @@ def transcribe_audio(audio_path, language=None):
     return local_asr.transcribe(audio_path, language=language)
 
 app = Flask(__name__, static_folder=None)
-CORS(app)  # 允许跨域请求
 app.config['MAX_CONTENT_LENGTH'] = BOOK_MAX_UPLOAD_BYTES
+
+if app_config.HOST.lower() not in app_config.LOOPBACK_HOSTS and not app_config.API_TOKEN:
+    raise SystemExit('拒绝启动：HOST 监听非回环地址时必须设置 API_TOKEN。')
+
+_WRITE_METHODS = {'POST', 'PUT', 'PATCH', 'DELETE'}
+_CORS_METHODS = _WRITE_METHODS | {'GET', 'HEAD', 'OPTIONS'}
+
+
+def _http_origin(url, *, referer=False):
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme not in {'http', 'https'} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None):
+            return None
+        if not referer and (parsed.path or parsed.query or parsed.fragment):
+            return None
+        default_port = 443 if parsed.scheme == 'https' else 80
+        return parsed.scheme, parsed.hostname, parsed.port if parsed.port is not None else default_port
+    except ValueError:
+        return None
+
+
+def _configured_origin(origin):
+    return origin is not None and any(origin == _http_origin(value) for value in app_config.CORS_ALLOW_ORIGINS)
+
+
+def _trusted_request_host(origin):
+    return origin is not None and (origin[1] in app_config.LOOPBACK_HOSTS
+                                  or app_config.API_TOKEN or _configured_origin(origin))
+
+
+def _is_loopback_peer(address):
+    try:
+        peer = ip_address(address)
+    except ValueError:
+        return False
+    return (getattr(peer, 'ipv4_mapped', None) or peer).is_loopback
+
+
+def _allowed_origin(origin):
+    if origin is None:
+        return False
+    current = _http_origin(request.host_url, referer=True)
+    return ((origin == current and _trusted_request_host(current))
+            or (current is not None and origin[0] == 'http'
+                and origin[1] in app_config.LOOPBACK_HOSTS and origin[2] == current[2])
+            or _configured_origin(origin))
+
+
+def _cors_preflight_method():
+    if request.method == 'OPTIONS' and request.url_rule and request.url_rule.provide_automatic_options:
+        method = request.headers.get('Access-Control-Request-Method')
+        if method in _CORS_METHODS and method in app.create_url_adapter(request).allowed_methods():
+            return method
+    return None
+
+
+@app.before_request
+def protect_requests():
+    is_api = request.path.startswith('/api/')
+    token = app_config.API_TOKEN
+    # Use WSGI's connection peer, never forwarding headers. A public reverse proxy
+    # connecting over loopback must be deployed with API_TOKEN.
+    if is_api and not token and not _is_loopback_peer(request.remote_addr):
+        return jsonify(success=False, error='无令牌模式仅允许回环连接访问 API'), 403
+    # Keep the Host allowlist as a separate browser/DNS rebinding safeguard.
+    if is_api and not token and not _trusted_request_host(_http_origin(request.host_url, referer=True)):
+        return jsonify(success=False, error='API 请求主机不在白名单内'), 403
+
+    origin = request.headers.get('Origin')
+    if request.method in _WRITE_METHODS:
+        referer = request.headers.get('Referer')
+        if origin is not None:
+            allowed = _allowed_origin(_http_origin(origin))
+        else:
+            allowed = referer is None or _allowed_origin(_http_origin(referer, referer=True))
+        if not allowed:
+            return jsonify(success=False, error='请求来源不在白名单内'), 403
+
+    # Browsers send preflights without credentials. Endpoint capability checks apply to the actual request.
+    if _cors_preflight_method() and origin and _allowed_origin(_http_origin(origin)):
+        return app.make_default_options_response()
+
+    if token and is_api:
+        scheme, _, bearer = request.headers.get('Authorization', '').partition(' ')
+        candidates = [request.headers.get('X-API-Token', '')]
+        if scheme.lower() == 'bearer':
+            candidates.append(bearer.strip())
+        if not any(compare_digest(token.encode('utf-8'), value.encode('utf-8')) for value in candidates):
+            return jsonify(success=False, error='API token 缺失或无效'), 401, {'WWW-Authenticate': 'Bearer'}
+
+
+@app.after_request
+def add_cors_headers(response):
+    response.vary.add('Origin')
+    origin = request.headers.get('Origin')
+    if origin and _allowed_origin(_http_origin(origin)):
+        response.headers['Access-Control-Allow-Origin'] = origin
+        method = _cors_preflight_method()
+        if method and response.status_code < 300:
+            response.headers['Access-Control-Allow-Methods'] = method
+            response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type, X-API-Token'
+            response.vary.add('Access-Control-Request-Method')
+    return response
 
 
 @app.before_request
@@ -176,6 +285,7 @@ VIDEO_STYLE_SUFFIX = (
 _video_inflight = set()
 _video_inflight_lock = threading.Lock()
 _video_status = {}
+_deleted_video_sessions = set()
 
 
 def _abs_session_dir(session_dir):
@@ -192,8 +302,117 @@ def _abs_session_dir(session_dir):
     return str(target)
 
 
-def _video_output_path(session_dir, paragraph_index):
-    return os.path.join(_abs_session_dir(session_dir), 'videos', f'video_{paragraph_index}.mp4')
+def _bookshelf_lexical_path(session_dir):
+    if not isinstance(session_dir, str) or not session_dir.strip() or '\x00' in session_dir:
+        raise ValueError('无效的 session_dir')
+    windows_path = PureWindowsPath(session_dir)
+    path = Path(session_dir.replace('\\', '/'))
+    if '..' in path.parts or ((windows_path.drive or path.anchor) and not path.is_absolute()):
+        raise ValueError('会话路径包含不允许的路径形式')
+    return Path(TARGET_DIR).absolute() / path
+
+
+def _checked_bookshelf_entry(path):
+    if path.is_symlink() or path.is_junction():
+        raise ValueError('会话路径不能经过符号链接或目录联接')
+    resolved = Path(os.path.realpath(path))
+    if resolved != path:
+        raise ValueError('会话路径解析结果与预期不符')
+    return resolved
+
+
+def _bookshelf_path(session_dir, *, shelf_only=False):
+    """Accept legacy Windows separators and keep resolved paths within their root."""
+    path = _bookshelf_lexical_path(session_dir)
+    try:
+        configured_base = Path(TARGET_DIR).absolute()
+        base = configured_base.resolve()
+        shelf_part = ('bookshelf',) if shelf_only else ()
+        root = base.joinpath(*shelf_part)
+        configured_root = configured_base.joinpath(*shelf_part)
+        # Check components before resolve() can access an external drive or UNC share.
+        lexical_root = configured_root if path.is_relative_to(configured_root) else root
+        relative = path.relative_to(lexical_root)
+        if not relative.parts:
+            raise ValueError('会话目录必须位于指定目录之下')
+        if os.name == 'nt' and any(
+            part.endswith(('.', ' ')) or ':' in part or PureWindowsPath(part).is_reserved()
+            for part in relative.parts
+        ):
+            raise ValueError('会话目录包含无效的 Windows 路径组件')
+
+        candidate = base
+        for part in shelf_part + relative.parts:
+            candidate = _checked_bookshelf_entry(candidate / part)
+        return candidate
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError('会话目录不在允许的数据目录内') from exc
+
+
+def _check_bookshelf_contents(directory):
+    # 尽力而为：校验与使用同一解析路径仍是分开的系统调用，无法阻止外部
+    # 进程在两者之间替换目录项。读取和复制还会在访问各路径时重新检查。
+    directory = _checked_bookshelf_entry(directory)
+    def raise_walk_error(error):
+        raise error
+
+    for parent, dirs, files in directory.walk(on_error=raise_walk_error):
+        for name in dirs + files:
+            _checked_bookshelf_entry(parent / name)
+
+
+def _check_bookshelf_copy_entries(directory, names):
+    directory = _checked_bookshelf_entry(Path(directory))
+    for name in names:
+        _checked_bookshelf_entry(directory / name)
+    return []
+
+
+def _copy_bookshelf_file(source, destination):
+    source = _checked_bookshelf_entry(Path(source))
+    shutil.copy2(source, destination, follow_symlinks=False)
+
+
+class VideoSessionRemoved(Exception):
+    pass
+
+
+def _uses_bookshelf_session(directory):
+    shelf = Path(TARGET_DIR).resolve() / 'bookshelf'
+    return directory != shelf and directory.is_relative_to(shelf)
+
+
+def _bookshelf_video_identity(directory):
+    stat = directory.stat()
+    shelf = Path(TARGET_DIR).resolve() / 'bookshelf'
+    book = shelf / directory.relative_to(shelf).parts[0]
+    try:
+        with (book / '.bookshelf-id').open('rb') as marker:
+            generation = marker.read(32)
+    except FileNotFoundError:
+        generation = None  # Older books have no marker.
+    return stat.st_dev, stat.st_ino, generation
+
+
+@contextmanager
+def _video_session_guard(directory, expected_identity=None):
+    if not _uses_bookshelf_session(directory):
+        if expected_identity is not None:
+            raise VideoSessionRemoved('书架绘本已删除或替换')
+        yield None
+        return
+
+    # Use the deletion lock across both the identity check and the write.
+    with _bookshelf_transaction():
+        try:
+            identity = _bookshelf_video_identity(directory)
+        except FileNotFoundError as exc:
+            raise VideoSessionRemoved('书架绘本已删除') from exc
+        if (directory, identity) in _deleted_video_sessions or (
+            expected_identity is not None and identity != expected_identity
+        ):
+            raise VideoSessionRemoved('书架绘本已删除或替换')
+        yield identity
 
 
 def build_page_video_prompt(page_text):
@@ -206,22 +425,30 @@ def build_page_video_prompt(page_text):
     return f"以这张绘本插图为第一帧，让画面轻微、自然地动起来。{VIDEO_STYLE_SUFFIX}"
 
 
-def _video_task_runner(prompt, image_path, session_dir, paragraph_index, force=False):
+def _video_task_runner(prompt, image_path, session_dir, paragraph_index, force, video_path, identity):
     """线程池包装：任务结束后清理 in-flight 标记。"""
     try:
-        path = _video_output_path(session_dir, paragraph_index)
-        _video_status[path] = {'status': 'running', 'error': None}
-        result = generate_video_task(prompt, image_path, session_dir, paragraph_index, force=force)
-        if not result:
-            raise RuntimeError('视频生成没有返回有效文件')
-        _video_status[path] = {'status': 'succeeded', 'error': None}
+        with _video_session_guard(session_dir, identity):
+            _video_status[video_path] = {'status': 'running', 'error': None, 'identity': identity}
+        result = generate_video_task(prompt, image_path, session_dir, paragraph_index,
+                                     force=force, session_identity=identity)
+        with _video_session_guard(session_dir, identity):
+            _video_status[video_path] = {'status': 'succeeded', 'error': None, 'identity': identity}
         return result
+    except VideoSessionRemoved:
+        return None
+    except BookshelfLockUnavailable:
+        raise
     except Exception as exc:
-        _video_status[_video_output_path(session_dir, paragraph_index)] = {'status': 'failed', 'error': str(exc)}
+        try:
+            with _video_session_guard(session_dir, identity):
+                _video_status[video_path] = {'status': 'failed', 'error': str(exc), 'identity': identity}
+        except VideoSessionRemoved:
+            return None
         raise
     finally:
         with _video_inflight_lock:
-            _video_inflight.discard(_video_output_path(session_dir, paragraph_index))
+            _video_inflight.discard((video_path, identity))
 
 
 def enqueue_video_task(prompt, image_path, session_dir, paragraph_index, force=False):
@@ -230,25 +457,30 @@ def enqueue_video_task(prompt, image_path, session_dir, paragraph_index, force=F
 
     Returns: 'cached' / 'running' / 'queued'
     """
-    video_path = _video_output_path(session_dir, paragraph_index)
-    if not force and _legacy_video_cached(prompt, image_path, video_path):
-        print(f"   ⏭️ 第 {paragraph_index + 1} 页视频已存在，跳过生成（缓存）")
-        return 'cached'
-
-    with _video_inflight_lock:
-        if video_path in _video_inflight:
-            print(f"   ⏳ 第 {paragraph_index + 1} 页视频已在生成中，跳过重复提交")
-            return 'running'
-        _video_inflight.add(video_path)
-
-    try:
-        _video_status[video_path] = {'status': 'queued', 'error': None}
-        video_executor.submit(_video_task_runner, prompt, image_path, session_dir, paragraph_index, force)
-        return 'queued'
-    except Exception:
+    session_dir = Path(_abs_session_dir(session_dir))
+    video_path = session_dir / 'videos' / f'video_{paragraph_index}.mp4'
+    with _video_session_guard(session_dir) as identity:
+        if not force and _legacy_video_cached(prompt, image_path, str(video_path)):
+            return 'cached'
+        task_key = (video_path, identity)
         with _video_inflight_lock:
-            _video_inflight.discard(video_path)
-        raise
+            if task_key in _video_inflight:
+                return 'running'
+            _video_inflight.add(task_key)
+        previous_status = _video_status.get(video_path)
+        _video_status[video_path] = {'status': 'queued', 'error': None, 'identity': identity}
+        try:
+            video_executor.submit(_video_task_runner, prompt, image_path, session_dir,
+                                  paragraph_index, force, video_path, identity)
+        except Exception:
+            with _video_inflight_lock:
+                _video_inflight.discard(task_key)
+            if previous_status is None:
+                _video_status.pop(video_path, None)
+            else:
+                _video_status[video_path] = previous_status
+            raise
+        return 'queued'
 
 
 def discover_session_pages(session_dir):
@@ -316,6 +548,8 @@ def submit_videos_for_session(session_dir, pages=None, force=False):
             prompt = page.get('prompt') or page.get('text') or ''
             status = enqueue_video_task(prompt, image_path, abs_dir, index, force=force)
             result[status].append(index)
+        except BookshelfLockUnavailable:
+            raise
         except Exception as e:
             result['errors'].append({'index': i, 'error': str(e)})
 
@@ -519,9 +753,9 @@ def enroll_voice():
 
         response = requests.post(f"{ENROLL_SERVER_URL}/enroll", json=request_data, timeout=60)
 
+        logger.info('音色注册上游状态 %s，响应字节数 %s', response.status_code, len(response.content))
         if response.status_code == 200:
             result = response.json()
-            print(result)
             # 保存 token
             token = result.get('token')
             save_path = ""
@@ -532,8 +766,7 @@ def enroll_voice():
                     json.dump(payload, f, ensure_ascii=False)
                 result['save_status'] = f"已保存到 {save_path}"
             else:
-                # 打印整个结果看看 token 到底在哪
-                print(f"DEBUG: 远程返回结果中没有找到 'token' 字段。完整结果: {result}")
+                logger.warning('音色注册上游响应缺少 token 字段')
                 result['save_status'] = "未保存：返回结果中缺少 token 字段"
             
             return jsonify(result)
@@ -561,20 +794,92 @@ def list_custom_voices():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+_bookshelf_lock = threading.RLock()
+_BOOKSHELF_LOCK_TIMEOUT = 5.0
+
+
+class BookshelfLockUnavailable(Exception):
+    pass
+
+
+@contextmanager
+def _bookshelf_transaction():
+    """Serialize access to the index across service processes on one host."""
+    try:
+        lock = (Path(TARGET_DIR) / '.bookshelf.lock').open('a+b')
+    except OSError as exc:
+        raise BookshelfLockUnavailable('无法打开书架锁文件') from exc
+    with lock:
+        if os.name == 'nt':
+            import msvcrt
+
+            # Windows allows a byte-range lock beyond the end of an empty file.
+            acquire = lambda: msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            release = lambda: msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            acquire = lambda: fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            release = lambda: fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+        deadline = time.monotonic() + _BOOKSHELF_LOCK_TIMEOUT
+        while True:
+            try:
+                lock.seek(0)
+                acquire()
+                break
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK, errno.EWOULDBLOCK}:
+                    raise BookshelfLockUnavailable('无法获取书架文件锁') from exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BookshelfLockUnavailable('等待书架文件锁超时，请稍后重试') from exc
+                time.sleep(min(0.05, remaining))
+        try:
+            with _bookshelf_lock:
+                yield
+        finally:
+            lock.seek(0)
+            release()
+
+
+@app.errorhandler(BookshelfLockUnavailable)
+def _bookshelf_busy(error):
+    return jsonify(success=False, error=str(error)), 503
+
+
 def load_bookshelf():
-    """加载书架数据"""
-    if os.path.exists(BOOKSHELF_FILE):
+    """只有索引缺失时才视为空书架。"""
+    with _bookshelf_lock:
         try:
             with open(BOOKSHELF_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
+                bookshelf = json.load(f)
+        except FileNotFoundError:
             return []
-    return []
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise OSError('书架索引损坏') from exc
+        if not isinstance(bookshelf, list) or any(not isinstance(book, dict) for book in bookshelf):
+            raise OSError('书架索引格式无效')
+        return bookshelf
+
 
 def save_bookshelf(bookshelf):
-    """保存书架数据"""
-    with open(BOOKSHELF_FILE, 'w', encoding='utf-8') as f:
-        json.dump(bookshelf, f, ensure_ascii=False, indent=2)
+    """在同一目录写完并关闭临时文件，然后原子替换索引。"""
+    index = Path(BOOKSHELF_FILE)
+    temporary_path = None
+    with _bookshelf_lock:
+        try:
+            with NamedTemporaryFile(mode='w', encoding='utf-8', dir=index.parent,
+                                    prefix=f'.{index.name}.', suffix='.tmp', delete=False) as f:
+                temporary_path = Path(f.name)
+                json.dump(bookshelf, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary_path, index)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
 
 
@@ -1257,11 +1562,14 @@ def save_story_text():
 def get_bookshelf():
     """获取书架列表"""
     try:
-        bookshelf = load_bookshelf()
+        with _bookshelf_transaction():
+            bookshelf = load_bookshelf()
         return jsonify({
             'success': True,
             'bookshelf': bookshelf
         })
+    except BookshelfLockUnavailable:
+        raise
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -1269,52 +1577,52 @@ def get_bookshelf():
 @app.route('/api/bookshelf/load', methods=['POST'])
 def load_book_from_shelf():
     """从书架加载绘本内容"""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(success=False, error='请求须为 JSON 对象'), 400
+    with _bookshelf_transaction():
+        return _load_bookshelf_book(data.get('session_dir'))
+
+
+def _load_bookshelf_book(session_dir):
     try:
-        data = request.json
-        session_dir = data.get('session_dir', '')
-        
-        # 处理session_dir，确保使用绝对路径
-        if session_dir:
-            # 如果是相对路径，转换为绝对路径
-            if not os.path.isabs(session_dir):
-                session_dir = os.path.join(TARGET_DIR, session_dir)
-        
-        if not session_dir or not os.path.exists(session_dir):
+        directory = _bookshelf_path(session_dir, shelf_only=True)
+        if not directory.is_dir():
             return jsonify({'success': False, 'error': '目录不存在'}), 400
+        _check_bookshelf_contents(directory)
+        data_root = Path(TARGET_DIR).resolve()
         
         def to_rel_path(p):
             """把绝对路径统一转成相对 TARGET_DIR 的 URL 路径（兼容 Windows 反斜杠）。"""
-            p = p.replace('\\', '/')
-            base = TARGET_DIR.replace('\\', '/')
-            return p[len(base) + 1:] if p.startswith(base + '/') else p
+            return _checked_bookshelf_entry(p).relative_to(data_root).as_posix()
         
         # 读取故事文本
-        story_file = os.path.join(session_dir, "story", "story.txt")
+        story_file = _checked_bookshelf_entry(directory / 'story' / 'story.txt')
         story_text = ""
         if os.path.exists(story_file):
             with open(story_file, 'r', encoding='utf-8') as f:
                 story_text = f.read()
         
         # 读取故事参数
-        params_file = os.path.join(session_dir, "story", "params.json")
+        params_file = _checked_bookshelf_entry(directory / 'story' / 'params.json')
         story_params = {}
         if os.path.exists(params_file):
             with open(params_file, 'r', encoding='utf-8') as f:
                 story_params = json.load(f)
         
         # 获取图片列表
-        images_dir = os.path.join(session_dir, "images")
+        images_dir = _checked_bookshelf_entry(directory / 'images')
         images = []
         if os.path.exists(images_dir):
             for f in sorted(os.listdir(images_dir)):
                 if f.endswith('.png'):
                     # 将绝对路径转换为相对于 TARGET_DIR 的相对路径
-                    image_path = os.path.join(session_dir, "images", f)
+                    image_path = images_dir / f
                     relative_path = to_rel_path(image_path)
                     images.append(relative_path)
         
         # 获取TTS列表
-        tts_dir = os.path.join(session_dir, "tts")
+        tts_dir = _checked_bookshelf_entry(directory / 'tts')
         # 分段故事（先定义，后面需要使用）
         paragraphs = [p.strip() for p in story_text.split('\n\n') if p.strip()]
         
@@ -1331,19 +1639,19 @@ def load_book_from_shelf():
             for f in sorted(os.listdir(tts_dir)):
                 if f.endswith('.wav'):
                     # 将绝对路径转换为相对于 TARGET_DIR 的相对路径
-                    audio_path = os.path.join(session_dir, "tts", f)
+                    audio_path = tts_dir / f
                     relative_path = to_rel_path(audio_path)
                     tts_files.append(relative_path)
         
         # 获取音乐列表（按段落索引匹配）
-        music_dir = os.path.join(session_dir, "music")
+        music_dir = _checked_bookshelf_entry(directory / 'music')
         music_files = []
         if os.path.exists(music_dir):
             # 使用已定义的 pure_paragraphs 获取段落数量
             total_paragraphs = len(pure_paragraphs)
             # 按段落索引顺序匹配音乐文件
             for i in range(total_paragraphs):
-                music_file = os.path.join(music_dir, f"music_{i}.wav")
+                music_file = music_dir / f"music_{i}.wav"
                 if os.path.exists(music_file):
                     # 将绝对路径转换为相对于 TARGET_DIR 的相对路径
                     relative_path = to_rel_path(music_file)
@@ -1353,7 +1661,7 @@ def load_book_from_shelf():
         
         # 读取试卷数据（如果存在）
         exam_data = None
-        exam_file = os.path.join(session_dir, "exam", "exam.json")
+        exam_file = _checked_bookshelf_entry(directory / 'exam' / 'exam.json')
         if os.path.exists(exam_file):
             try:
                 with open(exam_file, 'r', encoding='utf-8') as f:
@@ -1363,24 +1671,24 @@ def load_book_from_shelf():
                 print(f"   ⚠️ 读取试卷数据失败: {e}")
         
         # 获取合成后的音频文件（combined目录）
-        combined_dir = os.path.join(session_dir, "combined")
+        combined_dir = _checked_bookshelf_entry(directory / 'combined')
         combined_files = []
         if os.path.exists(combined_dir):
             for f in sorted(os.listdir(combined_dir)):
                 if f.endswith('.wav'):
                     # 将绝对路径转换为相对于 TARGET_DIR 的相对路径
-                    audio_path = os.path.join(session_dir, "combined", f)
+                    audio_path = combined_dir / f
                     relative_path = to_rel_path(audio_path)
                     combined_files.append(relative_path)
 
         # 获取视频文件列表
-        videos_dir = os.path.join(session_dir, "videos")
+        videos_dir = _checked_bookshelf_entry(directory / 'videos')
         video_files = []
         if os.path.exists(videos_dir):
             for f in sorted(os.listdir(videos_dir)):
                 if f.endswith('.mp4'):
                     # 将绝对路径转换为相对于 TARGET_DIR 的相对路径
-                    video_path = os.path.join(session_dir, "videos", f)
+                    video_path = videos_dir / f
                     relative_path = to_rel_path(video_path)
                     video_files.append(relative_path)
         
@@ -1389,14 +1697,14 @@ def load_book_from_shelf():
         
         # 加载百科数据（用于弹幕显示）
         baike_data = {}
-        baike_dir = os.path.join(session_dir, "baike")
+        baike_dir = _checked_bookshelf_entry(directory / 'baike')
         if os.path.exists(baike_dir):
             for f in sorted(os.listdir(baike_dir)):
                 if f.endswith('.json') and f.startswith('baike_'):
+                    baike_file = _checked_bookshelf_entry(baike_dir / f)
                     try:
                         # 从文件名提取段落索引，如 baike_0.json -> 0
                         idx = int(f.replace('baike_', '').replace('.json', ''))
-                        baike_file = os.path.join(baike_dir, f)
                         with open(baike_file, 'r', encoding='utf-8') as bf:
                             baike_data[str(idx)] = json.load(bf)
                         print(f"   ✅ 加载百科数据: 段落{idx}, {len(baike_data[str(idx)])} 个问答")
@@ -1404,7 +1712,7 @@ def load_book_from_shelf():
                         print(f"   ⚠️ 加载百科文件 {f} 失败: {e}")
         
         # 加载用户答案（如果存在）
-        exam_result_file = os.path.join(session_dir, "exam", "exam_result.json")
+        exam_result_file = _checked_bookshelf_entry(directory / 'exam' / 'exam_result.json')
         exam_result = None
         if os.path.exists(exam_result_file):
             try:
@@ -1427,6 +1735,8 @@ def load_book_from_shelf():
             'baike_data': baike_data,  # 添加百科数据（弹幕）
             'exam_result': exam_result  # 添加用户答案和完成状态
         })
+    except ValueError as e:
+        return jsonify(success=False, error=str(e)), 400
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -1435,66 +1745,82 @@ def load_book_from_shelf():
 def add_to_bookshelf():
     """添加绘本到书架"""
     try:
-        data = request.json
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify(success=False, error='请求须为 JSON 对象'), 400
         book_name = data.get('book_name', '')
         session_dir = data.get('session_dir', '')
         story_params = data.get('story_params', {})
         
-        if not book_name or not session_dir:
+        if not isinstance(book_name, str) or not book_name.strip() or not isinstance(story_params, dict):
             return jsonify({'success': False, 'error': '缺少必要参数'}), 400
-        
-        # 创建书架目录
-        bookshelf_dir = TARGET_DIR + '/bookshelf'
-        if not os.path.exists(bookshelf_dir):
-            os.makedirs(bookshelf_dir)
-            print(f"📚 创建书架目录: {bookshelf_dir}")
-        
+
         # 清理书名，移除不合法的文件名字符
-        safe_book_name = "".join(c for c in book_name if c not in r'\/:*?"<>|')
-        safe_book_name = safe_book_name.strip()
+        safe_book_name = "".join(c for c in book_name if c not in r'\/:*?"<>|' and ord(c) >= 32)
+        safe_book_name = safe_book_name.strip().rstrip('. ')
         if not safe_book_name:
             safe_book_name = f"绘本_{time.strftime('%Y%m%d%H%M%S')}"
-        
-        # 目标目录路径
-        target_dir = os.path.join(bookshelf_dir, safe_book_name)
-        
-        # 如果目标目录已存在，添加时间戳后缀
-        if os.path.exists(target_dir):
-            target_dir = os.path.join(bookshelf_dir, f"{safe_book_name}_{time.strftime('%H%M%S')}")
-        
-        # 复制原始目录到书架目录
-        source_dir = session_dir
-        source_dir = os.path.join(TARGET_DIR, source_dir)
-        if os.path.exists(source_dir):
-            import shutil
-            shutil.copytree(source_dir, target_dir)
-            print(f"📚 复制绘本目录: {source_dir} -> {target_dir}")
-            new_session_dir = target_dir
-        else:
-            print(f"⚠️ 原始目录不存在: {source_dir}，使用原路径")
-            new_session_dir = session_dir
-        
-        bookshelf = load_bookshelf()
-        
-        # 添加新书（使用新的目录路径）
-        new_book = {
-            'id': len(bookshelf) + 1,
-            'name': book_name,
-            'session_dir': new_session_dir.replace(TARGET_DIR+"/", ''),
-            'original_session_dir': session_dir,  # 保留原始路径
-            'story_topic': story_params.get('story_topic', ''),
-            'main_role': story_params.get('main_role', ''),
-            'scene': story_params.get('scene', ''),
-            'created_at': time.strftime('%Y-%m-%d %H:%M:%S')
-        }
-        
-        bookshelf.append(new_book)
-        save_bookshelf(bookshelf)
+
+        with _bookshelf_transaction():
+            bookshelf = load_bookshelf()
+            source_dir = _bookshelf_path(session_dir)
+            if not source_dir.is_dir():
+                return jsonify(success=False, error='原始会话目录不存在'), 400
+            data_root = Path(TARGET_DIR).resolve()
+            bookshelf_dir = _checked_bookshelf_entry(data_root / 'bookshelf')
+            if source_dir == bookshelf_dir:
+                return jsonify(success=False, error='书架根目录不能作为原始会话'), 400
+            _check_bookshelf_contents(source_dir)
+
+            target_dir = bookshelf_dir / safe_book_name
+            while (target_dir.is_symlink() or target_dir.is_junction() or target_dir.exists()
+                   or any(_same_bookshelf_record(str(target_dir), book.get('session_dir'))
+                          for book in bookshelf)):
+                target_dir = bookshelf_dir / f'{safe_book_name}_{uuid.uuid4().hex[:8]}'
+            target_dir = _bookshelf_path(str(target_dir), shelf_only=True)
+            target_dir.parent.mkdir(exist_ok=True)
+
+            new_book = {
+                'id': uuid.uuid4().hex,
+                'name': book_name,
+                'session_dir': target_dir.relative_to(data_root).as_posix(),
+                'original_session_dir': session_dir,
+                'story_topic': story_params.get('story_topic', ''),
+                'main_role': story_params.get('main_role', ''),
+                'scene': story_params.get('scene', ''),
+                'created_at': time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+            bookshelf.append(new_book)
+
+            # 尽力而为：逐项检查并避免 copytree 主动跟随符号链接。外部进程仍可
+            # 在检查与文件系统调用之间替换路径，临时副本发布前再校验一遍。
+            published = False
+            try:
+                with TemporaryDirectory(prefix='.adding-', dir=target_dir.parent) as staging:
+                    staged_book = Path(staging) / 'book'
+                    shutil.copytree(_checked_bookshelf_entry(source_dir), staged_book, symlinks=True,
+                                    ignore=_check_bookshelf_copy_entries, copy_function=_copy_bookshelf_file)
+                    _check_bookshelf_contents(staged_book)
+                    (staged_book / '.bookshelf-id').write_text(new_book['id'], encoding='ascii')
+                    staged_book.rename(_checked_bookshelf_entry(target_dir))
+                    published = True
+                save_bookshelf(bookshelf)
+            except Exception:
+                if published:
+                    try:
+                        shutil.rmtree(_checked_bookshelf_entry(target_dir))
+                    except (OSError, ValueError):
+                        logger.exception('清理未登记的书架副本失败')
+                raise
         
         return jsonify({
             'success': True,
             'book': new_book
         })
+    except BookshelfLockUnavailable:
+        raise
+    except ValueError as e:
+        return jsonify(success=False, error=str(e)), 400
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -1505,52 +1831,109 @@ def add_to_bookshelf():
 def remove_from_bookshelf():
     """从书架移除绘本"""
     try:
-        data = request.json
-        session_dir = data.get('session_dir', '')
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify(success=False, error='请求须为 JSON 对象'), 400
+        session_dir = data.get('session_dir')
         delete_files = data.get('delete_files', True)  # 是否同时删除文件
-        
-        if not session_dir:
-            return jsonify({'success': False, 'error': '缺少 session_dir 参数'}), 400
-        
-        bookshelf = load_bookshelf()
-        
-        # 查找并移除对应的书
-        original_length = len(bookshelf)
-        removed_book = None
-        new_bookshelf = []
-        for book in bookshelf:
-            if book.get('session_dir') == session_dir:
-                removed_book = book
-            else:
-                new_bookshelf.append(book)
-        
-        if len(new_bookshelf) == original_length:
-            return jsonify({'success': False, 'error': '未找到该绘本'}), 404
-        
-        save_bookshelf(new_bookshelf)
-        
-        # 如果需要删除文件，且目录在 bookshelf 文件夹内，则删除
-        if delete_files:
-            import shutil
-            # 处理相对路径和绝对路径的情况
-            if not os.path.isabs(session_dir):
-                session_dir = os.path.join(TARGET_DIR, session_dir)
-            
-            # 检查是否在bookshelf目录下
-            if f'{TARGET_DIR}/bookshelf/' in session_dir and os.path.exists(session_dir):
-                shutil.rmtree(session_dir)
-                print(f"📚 绘本文件夹已删除: {session_dir}")
-        
-        print(f"📚 绘本已从书架移除: {session_dir}")
+        identity = {field: data[field] for field in ('name', 'id', 'created_at') if field in data}
+
+        if not isinstance(delete_files, bool):
+            return jsonify(success=False, error='delete_files 须为布尔值'), 400
+        if not isinstance(session_dir, str):
+            return jsonify(success=False, error='无效的 session_dir'), 400
+        if identity and (not isinstance(identity.get('name'), str)
+                         or ('id' in identity and type(identity['id']) not in (int, str))
+                         or ('created_at' in identity and not isinstance(identity['created_at'], str))):
+            return jsonify(success=False, error='请提供名称及有效的记录 ID 或创建时间'), 400
+
+        with _bookshelf_transaction():
+            bookshelf = load_bookshelf()
+            legacy_name_only = set(identity) == {'name'}
+            # Match the stored value even when the legacy path no longer validates.
+            # Compare other spellings lexically to support old Windows records.
+            matches = [
+                i for i, book in enumerate(bookshelf)
+                if _same_bookshelf_record(session_dir, book.get('session_dir'))
+                and all(book.get(field) == value for field, value in identity.items())
+                and (not legacy_name_only or book.get('id') is None)
+            ]
+            if not matches:
+                if delete_files:
+                    _bookshelf_path(session_dir, shelf_only=True)
+                return jsonify(success=False, error='未找到该绘本'), 404
+            legacy_name_match = ('name' in identity and 'id' not in identity
+                                 and all(bookshelf[i].get('id') is None for i in matches))
+            if len(matches) > 1 and not legacy_name_match:
+                return jsonify(success=False, error='书架路径对应多条记录，请同时提供名称和记录 ID 或创建时间'), 409
+            removed = bookshelf.pop(matches[0])
+
+            save_bookshelf(bookshelf)
+            if delete_files:
+                try:
+                    directory = _bookshelf_path(removed['session_dir'], shelf_only=True)
+                    if any(_bookshelf_reference_is_within(book.get('session_dir'), directory)
+                           for book in bookshelf):
+                        return jsonify(success=True, message='绘本已从书架移除',
+                                       warning='仍有其他书架记录引用该目录，已保留文件')
+                    if not directory.is_dir():
+                        raise ValueError('书架路径不是有效目录')
+                    _check_bookshelf_contents(directory)
+                    # 尽力而为：重新确认已解析路径，外部进程仍可能在
+                    # 递归删除前替换目录项。
+                    directory = _checked_bookshelf_entry(directory)
+                except (RuntimeError, ValueError):
+                    return jsonify(success=True, message='绘本已从书架移除',
+                                   warning='书架文件路径无效或已失效，未删除任何文件')
+                except OSError:
+                    logger.exception('检查待删除的书架文件失败')
+                    return jsonify(success=False, index_removed=True,
+                                   error='绘本已从书架移除，但无法检查或删除文件'), 500
+                try:
+                    deleted_identity = _bookshelf_video_identity(directory)
+                    shutil.rmtree(directory)
+                    _deleted_video_sessions.add((directory, deleted_identity))
+                    for path in list(_video_status):
+                        if path.is_relative_to(directory):
+                            _video_status.pop(path, None)
+                except OSError:
+                    logger.exception('删除书架文件失败')
+                    return jsonify(success=False, index_removed=True,
+                                   error='绘本已从书架移除，但文件删除失败'), 500
         
         return jsonify({
             'success': True,
             'message': '绘本已从书架移除'
         })
+    except BookshelfLockUnavailable:
+        raise
+    except ValueError as e:
+        return jsonify(success=False, error=str(e)), 400
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def _same_bookshelf_record(requested, stored):
+    if requested == stored:
+        return True
+    try:
+        return _bookshelf_lexical_path(requested) == _bookshelf_lexical_path(stored)
+    except ValueError:
+        return False
+
+
+def _bookshelf_reference_is_within(session_dir, directory):
+    try:
+        path = _bookshelf_lexical_path(session_dir)
+    except ValueError:
+        return False
+    configured_root = Path(TARGET_DIR).absolute()
+    if not (path.is_relative_to(configured_root / 'bookshelf')
+            or path.is_relative_to(configured_root.resolve() / 'bookshelf')):
+        return False
+    return path.resolve().is_relative_to(directory)
 
 
 @app.route('/api/history_res/<path:filepath>')
@@ -2353,21 +2736,20 @@ def _legacy_video_cached(prompt, image_path, video_path):
         return False
 
 
-def generate_video_task(prompt, image_path, session_dir, paragraph_index, force=False):
+def generate_video_task(prompt, image_path, session_dir, paragraph_index, force=False, *, session_identity=None):
     """Generate a page with an input-aware cache; force reaches the actual task."""
     print(f"\n🎬 [视频生成] 开始生成段落 {paragraph_index} 的视频")
     print(f"   接收到的session_dir: {session_dir}")
     print(f"   图片: {image_path}")
 
-    session_dir = _abs_session_dir(session_dir)
-    video_dir = os.path.join(session_dir, 'videos')
-    os.makedirs(video_dir, exist_ok=True)
-    video_path = os.path.join(video_dir, f'video_{paragraph_index}.mp4')
-
-    # 已存在则跳过，支持中断后继续
-    if not force and _legacy_video_cached(prompt, image_path, video_path):
-        print(f"   ⏭️ 视频已存在，跳过: {video_path}")
-        return video_path
+    session_dir = Path(_abs_session_dir(session_dir))
+    video_dir = session_dir / 'videos'
+    video_path = str(video_dir / f'video_{paragraph_index}.mp4')
+    with _video_session_guard(session_dir, session_identity) as session_identity:
+        video_dir.mkdir(parents=True, exist_ok=True)
+        if not force and _legacy_video_cached(prompt, image_path, video_path):
+            print(f"   ⏭️ 视频已存在，跳过: {video_path}")
+            return video_path
 
     full_prompt = build_page_video_prompt(prompt)
     print(f"   提示词: {full_prompt[:80]}...")
@@ -2375,24 +2757,32 @@ def generate_video_task(prompt, image_path, session_dir, paragraph_index, force=
     last_error = None
     for attempt in range(1, 3):
         try:
-            temporary_path = video_path + f'.{uuid.uuid4().hex}.mp4'
-            result = video_generator.generate(
-                prompt=full_prompt,
-                image_path=image_path,
-                output_path=temporary_path,
-                duration=VIDEO_DURATION,
-                resolution=VIDEO_RESOLUTION,
-                aspect_ratio=VIDEO_RATIO,
-            )
-            if result and os.path.isfile(temporary_path) and os.path.getsize(temporary_path) > 1024:
-                if not probe_media(temporary_path)['has_video']:
-                    raise RuntimeError('视频服务返回文件没有有效视频流')
-                os.replace(temporary_path, video_path)
-                with open(video_path + '.json', 'w', encoding='utf-8') as metadata:
-                    json.dump({'cache_key': _legacy_video_identity(prompt, image_path)}, metadata)
-                print(f"   ✅ 视频生成成功: {video_path}")
-                return video_path
+            with _video_session_guard(session_dir, session_identity):
+                cache_key = _legacy_video_identity(prompt, image_path)
+            # The downloader creates its output directory and writes a .part file.
+            # Keep both outside the book while waiting for the remote result.
+            with TemporaryDirectory(prefix='.video-', dir=TARGET_DIR) as staging:
+                temporary_path = os.path.join(staging, 'video.mp4')
+                result = video_generator.generate(
+                    prompt=full_prompt,
+                    image_path=image_path,
+                    output_path=temporary_path,
+                    duration=VIDEO_DURATION,
+                    resolution=VIDEO_RESOLUTION,
+                    aspect_ratio=VIDEO_RATIO,
+                )
+                if result and os.path.isfile(temporary_path) and os.path.getsize(temporary_path) > 1024:
+                    if not probe_media(temporary_path)['has_video']:
+                        raise RuntimeError('视频服务返回文件没有有效视频流')
+                    with _video_session_guard(session_dir, session_identity):
+                        os.replace(temporary_path, video_path)
+                        with open(video_path + '.json', 'w', encoding='utf-8') as metadata:
+                            json.dump({'cache_key': cache_key}, metadata)
+                    print(f"   ✅ 视频生成成功: {video_path}")
+                    return video_path
             last_error = '未返回有效视频文件'
+        except (VideoSessionRemoved, BookshelfLockUnavailable):
+            raise
         except VolcanoVideoError as e:
             last_error = str(e)
             print(f"   ⚠️ 视频生成失败（第 {attempt}/2 次）: {e}")
@@ -2401,10 +2791,6 @@ def generate_video_task(prompt, image_path, session_dir, paragraph_index, force=
             print(f"   ⚠️ 视频生成异常（第 {attempt}/2 次）: {e}")
             import traceback
             traceback.print_exc()
-        finally:
-            if 'temporary_path' in locals() and os.path.isfile(temporary_path):
-                os.remove(temporary_path)
-
         if attempt < 2:
             time.sleep(5)
 
@@ -2423,12 +2809,24 @@ def check_file_exists():
             return jsonify({'exists': False, 'error': '缺少file_path参数'}), 400
         
         # 将相对路径转换为绝对路径
-        absolute_path = _abs_session_dir(file_path)
+        absolute_path = Path(_abs_session_dir(file_path))
         state = _video_status.get(absolute_path, {})
-        exists = os.path.isfile(absolute_path) and state.get('status') not in {'queued', 'running', 'failed'}
+        if state.get('status') in {'queued', 'running'}:
+            with _video_inflight_lock:
+                if (absolute_path, state.get('identity')) not in _video_inflight:
+                    state = {}
+        if state.get('identity') is not None:
+            try:
+                with _video_session_guard(absolute_path.parent.parent, state['identity']):
+                    pass
+            except VideoSessionRemoved:
+                state = {}
+        exists = absolute_path.is_file() and state.get('status') not in {'queued', 'running', 'failed'}
         return jsonify({'exists': exists, 'file_path': file_path,
                         'status': state.get('status', 'succeeded' if exists else 'missing'),
                         'error': state.get('error')})
+    except BookshelfLockUnavailable:
+        raise
     except Exception as e:
         return jsonify({'exists': False, 'error': str(e)}), 500
 
@@ -2470,7 +2868,10 @@ def generate_video_api():
             'status': status,
             'paragraph_index': paragraph_index
         })
-        
+    except BookshelfLockUnavailable:
+        raise
+    except VideoSessionRemoved as e:
+        return jsonify(success=False, error=str(e)), 404
     except Exception as e:
         print(f"❌ 视频生成接口错误: {str(e)}")
         import traceback
@@ -2511,7 +2912,8 @@ def generate_videos_api():
             }), 500
 
         result = submit_videos_for_session(abs_dir, pages=pages, force=force)
-        print(f"🎬 批量视频任务: {result}")
+        logger.info('批量视频任务数量：排队 %d，缓存 %d，运行中 %d，错误 %d',
+                    len(result['queued']), len(result['cached']), len(result['running']), len(result['errors']))
         return jsonify({
             'success': True,
             'session_dir': session_dir,
@@ -2519,6 +2921,8 @@ def generate_videos_api():
             if os.path.isdir(os.path.join(abs_dir, 'videos')) else 0,
             **result,
         })
+    except BookshelfLockUnavailable:
+        raise
     except VolcanoVideoError as e:
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
@@ -2562,8 +2966,7 @@ def analyze_image():
             "debug": False
         })
         
-        print(f"✅ 图片分析完成: {len(result) if isinstance(result, dict) else 0} 个主体")
-        print(f"   分析结果: {json.dumps(result, ensure_ascii=False)}")
+        logger.info('图片分析完成，主体数 %d', len(result) if isinstance(result, (dict, list)) else 0)
         
         return jsonify({
             'success': True,
@@ -2910,7 +3313,7 @@ def _open_quick_browser(url):
 
 
 if __name__ == '__main__':
-    host, port = os.environ.get('HOST', '127.0.0.1'), int(os.environ.get('PORT', '5000'))
+    host, port = app_config.HOST, int(os.environ.get('PORT', '5000'))
     if '--open-quick' in sys.argv[1:]:
         from werkzeug.serving import make_server
 

@@ -25,6 +25,12 @@ def _load_env_file(path):
 if os.environ.get("PAPERBOOK_SKIP_DOTENV", "").lower() not in ("1", "true", "yes"):
     _load_env_file(os.path.join(_BASE_DIR, ".env"))
 TARGET_DIR = os.path.abspath(os.path.expanduser(os.environ.get("TARGET_DIR") or _BASE_DIR))
+HOST = os.environ.get('HOST', '127.0.0.1').strip()
+API_TOKEN = os.environ.get('API_TOKEN', '').strip()
+CORS_ALLOW_ORIGINS = tuple(
+    origin.strip() for origin in os.environ.get('CORS_ALLOW_ORIGINS', '').split(',') if origin.strip()
+)
+LOOPBACK_HOSTS = frozenset({'127.0.0.1', 'localhost', '::1'})
 
 
 def _env(key, default="xxxx"):

@@ -3,18 +3,18 @@ flask-cors==4.0.0
 requests==2.31.0
 pydantic==2.5.0
 tqdm==4.66.1
-numpy
-pillow
+numpy==2.5.5
+pillow==13.0.0
 pymupdf==2.1
-opencv-python
-websockets
-sseclient-py
+opencv-python==5.1.0.95
+websockets==17.4
+sseclient-py==2.1.0
 # 本地免费 TTS / ASR
-edge-tts
-imageio-ffmpeg
-faster-whisper
+edge-tts==7.3.1
+imageio-ffmpeg==0.8.1
+faster-whisper==1.2.1
 # 问答同音容错检索、识别结果繁转简
-pypinyin
-zhconv
+pypinyin==0.55.0
+zhconv==1.4.3
 # 可选：OSS 上传功能（generate_video.py）
-oss2
+oss2==2.19.1

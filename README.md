@@ -53,6 +53,15 @@ if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 - 文生图、音乐、音效为可选配置；新 PDF 管线直接保留原页图，不要求先重绘。
 - 运行数据默认写入 `app/output_dir/books/`；可通过 `TARGET_DIR` 更改数据根目录。不要提交 `.env`、权重或运行产物。
 
+### 安全与部署
+
+- 浏览器默认可从同源和服务端口上的 `http://127.0.0.1`、`http://localhost`、`http://[::1]` 访问。`CORS_ALLOW_ORIGINS` 可在 `app/.env` 中追加逗号分隔的来源，例如 `https://reader.example.com,http://localhost:5173`。来源只由协议、主机和端口组成，`/tts-story-book` 前缀无需单独配置。留空 `API_TOKEN` 时，API 只接受回环主机或此列表中显式配置的访问地址。
+- 写入请求优先检查 `Origin`，缺少时检查有值的 `Referer`。两者都缺少时，通过来源检查，便于使用 curl 等客户端。
+- `HOST` 设置为非回环地址（如 `0.0.0.0`）时，必须设置 `API_TOKEN` 才能启动。设置后，`/api/*` 及其带前缀的地址要求 `Authorization: Bearer <token>` 或 `X-API-Token: <token>`。允许来源的 CORS 预检、`/health` 和静态页面可直接访问。
+- 现有页面的 API 请求不携带令牌，直接使用工作台时请保持默认回环监听并留空 `API_TOKEN`。跨机器调用使用能发送令牌的客户端，并通过 HTTPS 传输。
+- 同一主机上共用 `TARGET_DIR` 的服务进程通过 `.bookshelf.lock` 同步书架操作。请使用支持文件锁的本地文件系统，并在服务运行期间保留锁文件。获取锁失败或等候超时会返回 HTTP 503。
+- 精确移除书架记录时，向 `POST /api/bookshelf/remove` 发送列表中的 `session_dir`、`name` 和 `id` 或 `created_at`。无 ID 的旧记录可用路径和名称匹配首条记录。旧客户端只传路径时，该路径必须唯一。仍被其他记录引用的目录会保留，响应包含 `warning`。
+
 ## 受控复现
 
 从仓库根目录运行：
